@@ -200,7 +200,7 @@ function timetableGridHTML(rows, opts = {}) {
 const DEMO_HELP = {
   admin: '<b>Demo login (Admin):</b><br>Username: <code>admin</code><br>Password: <code>admin123</code><br>Full access — students, fees, results, teachers, backup.',
   teacher: '<b>Demo login (Teacher):</b><br>Username: <code>ahmed</code> (ya fatima, asif, ayesha, bilal, sana, usman, maryam, hassan, hira, omar, zainab, danish, amna)<br>Password: <code>teacher123</code><br>Teacher sirf apni classes/subjects dekh sakta hai — fees aur salaries nahi.',
-  parent: '<b>Demo login (Parent):</b><br>Username: <code>parent1</code> — bacha Sara Qureshi, Nursery<br>Username: <code>parent2</code> — Noor Ali, Class 1 &nbsp;|&nbsp; <code>parent3</code> — Amna Ahmed, Class 5<br>Username: <code>parent4</code> — Laiba Butt, Class 8 &nbsp;|&nbsp; <code>parent5</code> — Noor Hussain, Class 10<br>Password (sab ke liye): <code>parent123</code><br>Parent sirf apna bacha dekh sakta hai. Naya parent account phone + roll no + class se banta hai.',
+  parent: '<b>Demo login (Parent):</b><br>Username: <code>parent1</code> — bacha Sara Qureshi, Nursery<br>Username: <code>parent2</code> — Noor Ali, Class 1 &nbsp;|&nbsp; <code>parent3</code> — Amna Ahmed, Class 5<br>Username: <code>parent4</code> — Laiba Butt, Class 8 &nbsp;|&nbsp; <code>parent5</code> — Noor Hussain, Class 10<br>Password (sab ke liye): <code>parent123</code><br>Parent sirf apna bacha dekh sakta hai. Naye student ka parent login admin ke student add karte hi khud ban jata hai — ya phone + roll no + class se khud bhi bana sakte hain.',
 };
 function setRole(role) {
   loginRole = role;
@@ -381,6 +381,7 @@ async function loadDashboard() {
     <button onclick="tab='notifications';renderTabs();loadTab('notifications')">${esc(t('notifTitle'))}</button></div>
     <div class="card"><h3>${esc(c.name)} — poori profile</h3><p>Father: ${esc(c.father_name)} | Class ${esc(c.class_name)}-${esc(c.section)} | Roll ${esc(c.roll_no)}</p>
     <p>Attendance: ${d.attPresent} / ${d.attTotal} days present (${d.attPct}%)${d.attLate ? ' — ' + d.attLate + ' late (late bhi present mein shamil hai)' : ''}. Fees: Rs ${d.feesPaid.toLocaleString()} paid of Rs ${d.feesTotal.toLocaleString()}.</p>
+    ${d.children && d.children.length > 1 ? `<p>Aap ke ${d.children.length} bachay hain (${d.children.map(x => esc(x.name) + ' — Class ' + esc(x.class_name)).join(', ')}) — My Child tab mein har bachay ki profile dekhein.</p>` : ''}
     <button onclick="tab='students';renderTabs();loadTab('students')">View Full Profile</button></div>`;
     // Latest unread notifications on the parent dashboard (own child only).
     try {
@@ -464,14 +465,29 @@ function studentForm(s) {
   <label>Roll No</label><input id="m_roll" value="${esc(s.roll_no||'')}">
   <label>B-Form No. (Birth Form / B-Form number)</label><input id="m_bform" placeholder="e.g. 35202-1234567-1" value="${esc(s.b_form_no||'')}">
   <label>Parent phone</label><input id="m_phone" value="${esc(s.phone||'')}">
+  ${s.id ? '' : '<p style="font-size:13px;color:var(--muted)">Is student ka parent login khud ban jayega — save karte hi username + password dikhaya jayega (password parent123). Agar isi phone par bhai/behen ka parent login pehle se hai to wahi login use hoga, naya nahi banega.</p>'}
   <label>Monthly fee (Rs)</label><input id="m_fee" type="number" value="${s.monthly_fee||1500}">
   <label>Admission date</label><input id="m_adm" type="date" value="${esc(s.admission_date||'2026-04-01')}">
   <div style="display:flex;gap:8px;margin-top:12px"><button id="m_save">Save (server)</button><button class="secondary" onclick="closeModal()">Cancel</button></div>`);
   $('#m_save').onclick = async () => {
     const body = { name: $('#m_name').value, father_name: $('#m_father').value, class_name: $('#m_class').value, section: $('#m_section').value, roll_no: $('#m_roll').value, b_form_no: $('#m_bform').value.trim(), phone: $('#m_phone').value, monthly_fee: +$('#m_fee').value, admission_date: $('#m_adm').value };
-    if (s.id) await api('/api/students/' + s.id, { method: 'PUT', body: JSON.stringify(body) });
-    else await api('/api/students', { method: 'POST', body: JSON.stringify(body) });
-    closeModal(); loadStudents();
+    try {
+      let r;
+      if (s.id) r = await api('/api/students/' + s.id, { method: 'PUT', body: JSON.stringify(body) });
+      else r = await api('/api/students', { method: 'POST', body: JSON.stringify(body) });
+      closeModal(); loadStudents();
+      // Auto parent login (new student, or an old student edited before
+      // this feature): show the parent's username + password to the
+      // admin right away so it can be given to the parent.
+      if (r && r.parentLogin) {
+        const pl = r.parentLogin;
+        alert(pl.reused
+          ? (pl.passwordKnown
+            ? 'Student saved! Parent login pehle se bana hua hai — Username: ' + pl.username + ' | Password: parent123 (isi phone wale bhai/behen ka login use ho raha hai).'
+            : 'Student saved! Parent login pehle se bana hua hai — Username: ' + pl.username + ' (password wohi hai jo parent ne khud rakha tha).')
+          : 'Student saved! Parent login ban gaya hai — Username: ' + pl.username + ' | Password: parent123. Ye login parent ko de dein — wo sirf isi bachay ko dekh sakta hai.');
+      }
+    } catch (e) { alert(e.message); }
   };
 }
 const gradeFor = pct => pct >= 90 ? 'A+' : pct >= 80 ? 'A' : pct >= 70 ? 'B' : pct >= 60 ? 'C' : pct >= 50 ? 'D' : 'F';
@@ -543,8 +559,21 @@ window.viewStudent = async (id) => {
     </div>
   </div>`).join('')}
   </div>`;
+  // Admin sees this student's parent login in the profile, so the
+  // school office can give it to the parent (password only when it is
+  // the known auto one, parent123).
+  let parentLoginHtml = '';
+  if (isAdmin) {
+    try {
+      const pl = await api('/api/students/' + id + '/parent-login');
+      parentLoginHtml = pl.hasLogin
+        ? `<p><b>Parent login:</b> Username <code>${esc(pl.username)}</code> — ${pl.passwordKnown ? 'Password <code>parent123</code>' : 'password parent ne khud set kiya tha'}</p>`
+        : '<p><b>Parent login:</b> abhi nahi bana — Edit se save karein to ban jayega.</p>';
+    } catch (e) { parentLoginHtml = ''; }
+  }
   openModal(`<h3>${esc(s.name)} — Class ${esc(s.class_name)}-${esc(s.section)}</h3>
   <p>Roll ${esc(s.roll_no)} | Father: ${esc(s.father_name)} | Phone: ${esc(s.phone)}<br>B-Form No: ${esc(s.b_form_no || '— not recorded yet (Edit se add karein)')} | Monthly fee Rs ${s.monthly_fee} | Admission ${esc(s.admission_date)} | Status ${s.status}</p>
+  ${parentLoginHtml}
   ${examAccordionHTML}
   <h4>Previous Class Results</h4>
   ${prevRows.length ? `<table><tr><th>Exam</th><th>Class</th><th>Total</th><th>%</th><th>Grade</th><th>Year</th><th></th></tr>${prevRows.map((r, i)=>`<tr><td>${esc(r.exam)}</td><td>${esc(r.cls)}</td><td>${esc(r.marks)}</td><td>${r.pct}%</td><td>${gradeFor(+r.pct)}</td><td>${esc(r.year)}</td><td><button class="secondary" onclick="viewPrevReportCard(${i})">View Report Card</button></td></tr>`).join('')}</table><p style="font-size:13px;color:var(--muted)">“View Report Card” se us purani class/exam ka poora report card khulta hai — subjects, marks, total, percentage aur grade ke saath. Promotion-record rows come from the promotion history; subject-result rows were added with a previous class chosen in Add Result.</p>` : '<p>No previous class results yet. Admin/teacher can add one from Results → + Add Result, class chunein (purani class), aur exam/marks likhein.</p>'}
