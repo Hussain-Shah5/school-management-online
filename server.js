@@ -104,6 +104,27 @@ CREATE TABLE IF NOT EXISTS timetable_overrides (
   start_time TEXT NOT NULL, end_time TEXT NOT NULL,
   UNIQUE(class_name, date, period)
 );
+-- Parent notifications (in-system only — no SMS / WhatsApp / external
+-- send). One row per (student, type, ref_key): absence = one per
+-- student+date, fee = one per student+month, result = one per
+-- student+exam, manual = one per send (unique ref_key each time).
+-- A parent only ever sees rows for their own child (student_id), enforced
+-- in the API — never another child's rows. No phone numbers or wa.me links
+-- are stored or sent with a notification.
+CREATE TABLE IF NOT EXISTS notifications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  student_id INTEGER NOT NULL,
+  parent_user_id INTEGER,
+  type TEXT NOT NULL,
+  title TEXT NOT NULL,
+  message TEXT NOT NULL,
+  ref_key TEXT NOT NULL DEFAULT '',
+  related_date TEXT DEFAULT '',
+  amount INTEGER,
+  is_read INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  UNIQUE(student_id, type, ref_key)
+);
 `);
 
 // ---------- helpers ----------
@@ -131,6 +152,116 @@ function subjectsForClass(cls) {
 function grade(pct) {
   if (pct >= 90) return 'A+'; if (pct >= 80) return 'A'; if (pct >= 70) return 'B';
   if (pct >= 60) return 'C'; if (pct >= 50) return 'D'; return 'F';
+}
+// Late counts as present EVERYWHERE (admin dashboard Present Today,
+// teacher dashboard, parent attendance %, monthly summaries, staff too):
+// a student who came late still came, so marking Late must never lower
+// the Present figure. Present = Present + Late; Late is still counted
+// and shown separately wherever late is tracked.
+function isPresentStatus(s) { return s === 'Present' || s === 'Late'; }
+function presentCount(attRows) {
+  return attRows.reduce((a, r) => a + (isPresentStatus(r.status) ? (r.c || 0) : 0), 0);
+}
+function lateCount(attRows) {
+  const r = attRows.find(a => a.status === 'Late');
+  return r ? (r.c || 0) : 0;
+}
+// Exam names: results are ONLY these three terms — the Add Result form
+// offers them as a dropdown (no free text), and old "Mid Term 2026"
+// results already use one of them, so nothing old breaks.
+const EXAM_OPTIONS = ['1st Term 2026', 'Mid Term 2026', 'Final Term 2026'];
+
+// ---------- parent notifications (in-system only) ----------
+// Auto-created when: a student is marked Absent/Late, a fee challan is
+// pending/partial, a result is published. A notification is only created
+// when a parent account exists for that student (auto ones) — otherwise
+// nobody could ever read it. Manual admin notifications are always
+// created (the student may get a parent account later). Scoping is by
+// student_id: a parent login only ever receives rows for their own child.
+function parentUserIdForStudent(studentId) {
+  const u = db.prepare("SELECT id FROM users WHERE role='parent' AND student_id=?").get(studentId);
+  return u ? u.id : null;
+}
+function createNotification(studentId, type, title, message, refKey, extra) {
+  extra = extra || {};
+  const parentId = parentUserIdForStudent(studentId);
+  if (extra.onlyIfParent !== false && !parentId) return 0;
+  try {
+    const r = db.prepare('INSERT OR IGNORE INTO notifications (student_id,parent_user_id,type,title,message,ref_key,related_date,amount,is_read,created_at) VALUES (?,?,?,?,?,?,?,?,0,?)')
+      .run(studentId, parentId, type, title, message, refKey, extra.related_date || '', extra.amount != null ? extra.amount : null, new Date().toISOString());
+    return r.changes;
+  } catch (e) { console.log('createNotification skipped: ' + e.message); return 0; }
+}
+function clearNotification(studentId, type, refKey) {
+  try { db.prepare('DELETE FROM notifications WHERE student_id=? AND type=? AND ref_key=?').run(studentId, type, refKey); } catch (e) { /* best effort */ }
+}
+function notifyAbsence(studentId, status, date) {
+  const s = db.prepare('SELECT name FROM students WHERE id=?').get(studentId);
+  if (!s) return 0;
+  if (status === 'Absent') return createNotification(studentId, 'absence', 'Absent — ' + s.name, s.name + ' was absent on ' + date + '.', date, { related_date: date });
+  if (status === 'Late') return createNotification(studentId, 'absence', 'Late — ' + s.name, s.name + ' was late on ' + date + '.', date, { related_date: date });
+  return 0;
+}
+function notifyFeePending(studentId, month) {
+  const f = db.prepare('SELECT f.*, s.name FROM fees f JOIN students s ON s.id=f.student_id WHERE f.student_id=? AND f.month=?').get(studentId, month);
+  if (!f || f.status === 'paid') return 0;
+  const pending = f.amount - f.paid;
+  return createNotification(studentId, 'fee', 'Fee pending — ' + f.name,
+    f.name + ' — ' + month + ' fee pending: Rs ' + pending.toLocaleString() + ' (paid Rs ' + f.paid.toLocaleString() + ' of Rs ' + f.amount.toLocaleString() + ').',
+    month, { related_date: month + '-01', amount: pending });
+}
+function notifyResultPublished(studentId, exam) {
+  const s = db.prepare('SELECT name FROM students WHERE id=?').get(studentId);
+  if (!s) return 0;
+  const row = db.prepare('SELECT COALESCE(SUM(marks),0) m, COALESCE(SUM(total_marks),0) t FROM results WHERE student_id=? AND exam=?').get(studentId, exam);
+  const pct = row.t ? Math.round(row.m / row.t * 1000) / 10 : 0;
+  return createNotification(studentId, 'result', 'Result published — ' + s.name,
+    s.name + ' — ' + exam + ' result published: ' + pct + '% (Grade ' + grade(pct) + ').',
+    exam, { related_date: new Date().toISOString().slice(0, 10) });
+}
+// ---------- repeated-late rule (status count only — NO time field) ----------
+// "Time nhi likhna attendance ka": there is NO arrival-time / late-minutes
+// input anywhere. Late is just a status (Present / Absent / Late / Leave).
+// The 30-minute rule is guidance for the teacher only: if a student
+// arrives 30+ minutes after Period 1 starts (08:00, i.e. 08:30 or later),
+// the teacher marks Late — the system never asks for or computes a time.
+// Counting is purely by Late status: in one month, the 4th Late (more
+// than 3) notifies the parent, and EVERY Late after that in the same
+// month notifies again — not just the first time.
+function countLatesThisMonth(studentId, month) {
+  const r = db.prepare("SELECT COUNT(*) c FROM attendance WHERE student_id=? AND substr(date,1,7)=? AND status='Late'").get(studentId, month);
+  return r ? r.c : 0;
+}
+function notifyRepeatedLate(studentId, date) {
+  const month = String(date).slice(0, 7);
+  const count = countLatesThisMonth(studentId, month);
+  if (count < 4) return 0; // 1st-3rd late: no notification yet
+  const s = db.prepare('SELECT name FROM students WHERE id=?').get(studentId);
+  if (!s) return 0;
+  // ref_key = month + ':' + date, so each late day notifies once, and
+  // re-marking the same day does not duplicate it.
+  return createNotification(studentId, 'late', 'Bar bar late — ' + s.name,
+    s.name + ' has been late ' + count + ' times in ' + month + ' (more than 3 days late this month). Please ensure on-time arrival.',
+    month + ':' + date, { related_date: date, amount: count });
+}
+// Seed a few example notifications for the demo parents (parent1-5),
+// built ONLY from real seeded data: a pending/partial Nov 2026 fee and
+// the published Mid Term 2026 result. (No absence seed: all five demo
+// children were Present on both seeded attendance days, 24-25 Nov 2026,
+// so there is no real absence to seed — marking one absent creates it.)
+// Idempotent: INSERT OR IGNORE on (student_id, type, ref_key).
+function seedNotifications() {
+  try {
+    let made = 0;
+    const parents = db.prepare("SELECT id, student_id FROM users WHERE role='parent' AND student_id IS NOT NULL").all();
+    for (const p of parents) {
+      made += notifyFeePending(p.student_id, '2026-11');
+      const hasResult = db.prepare("SELECT 1 FROM results WHERE student_id=? AND exam='Mid Term 2026' LIMIT 1").get(p.student_id);
+      if (hasResult) made += notifyResultPublished(p.student_id, 'Mid Term 2026');
+    }
+    if (made) console.log('seedNotifications: created ' + made + ' demo parent notification(s)');
+    return made;
+  } catch (e) { console.log('seedNotifications skipped: ' + e.message); return 0; }
 }
 
 // ---------- one teacher = one subject ----------
@@ -455,6 +586,10 @@ function ensureUserColumns() {
   if (!cols.includes('role')) db.exec("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'");
   if (!cols.includes('teacher_id')) db.exec('ALTER TABLE users ADD COLUMN teacher_id INTEGER');
   if (!cols.includes('student_id')) db.exec('ALTER TABLE users ADD COLUMN student_id INTEGER');
+  // UI language choice per user (en / ur) — UI preference only, never
+  // school data. The frontend also keeps it in localStorage so the login
+  // page can show the right language before login.
+  if (!cols.includes('language')) db.exec("ALTER TABLE users ADD COLUMN language TEXT NOT NULL DEFAULT 'en'");
 }
 // New teacher-profile fields (full-info form): father_name, cnic, dob,
 // email, address, experience, joining_date. Older databases (already
@@ -650,7 +785,7 @@ function teacherProfile(id) {
     return { ...a, avg: row && row.avg ? Math.round(row.avg * 10) / 10 : 0, students: row ? row.n : 0, top };
   });
   const staffAtt = db.prepare('SELECT * FROM staff_attendance WHERE teacher_id=? ORDER BY date DESC LIMIT 30').all(id);
-  const attPct = staffAtt.length ? Math.round(staffAtt.filter(a => a.status === 'Present').length / staffAtt.length * 1000) / 10 : 0;
+  const attPct = staffAtt.length ? Math.round(staffAtt.filter(a => isPresentStatus(a.status)).length / staffAtt.length * 1000) / 10 : 0; // Late counts as present
   const timetable = db.prepare('SELECT * FROM timetable WHERE teacher_id=? ORDER BY day, period').all(id);
   return { ...t, assignments, progress, staffAtt, attPct, timetable };
 }
@@ -840,6 +975,7 @@ ensureTeacherColumns();
 ensureResultsClassColumn();
 ensureStudentBFormColumn();
 ensureRoleAccounts();
+seedNotifications();
 cleanTeacherAssignments();
 dedupeClassSubjectAssignments();
 fixTimetableConflicts();
@@ -895,9 +1031,19 @@ app.post('/api/login', (req, res) => {
 app.post('/api/logout', (req, res) => { req.session.destroy(() => res.json({ ok: true })); });
 app.get('/api/me', (req, res) => {
   if (!req.session.userId) return res.json({ loggedIn: false });
-  const u = db.prepare('SELECT username, school_name, role, teacher_id, student_id FROM users WHERE id=?').get(req.session.userId);
+  const u = db.prepare('SELECT username, school_name, role, teacher_id, student_id, language FROM users WHERE id=?').get(req.session.userId);
   if (!u) return res.json({ loggedIn: false });
-  res.json({ loggedIn: true, username: u.username, schoolName: u.school_name, role: u.role || 'admin', teacherId: u.teacher_id || null, studentId: u.student_id || null });
+  res.json({ loggedIn: true, username: u.username, schoolName: u.school_name, role: u.role || 'admin', teacherId: u.teacher_id || null, studentId: u.student_id || null, language: u.language || 'en' });
+});
+// UI language choice for this user (en / ur). Stored server-side per
+// user AND in the browser's localStorage (frontend) — either one alone is
+// enough; both are kept so the login page can already show Urdu before
+// login and the choice survives a different browser.
+app.post('/api/language', requireAuth, (req, res) => {
+  const lang = (req.body || {}).language;
+  if (lang !== 'en' && lang !== 'ur') return res.status(400).json({ error: 'Language must be en or ur' });
+  db.prepare('UPDATE users SET language=? WHERE id=?').run(lang, req.session.userId);
+  res.json({ ok: true, language: lang });
 });
 // scoped self endpoints (no other student's / teacher's data)
 app.get('/api/my-child', requireRole('parent'), (req, res) => {
@@ -924,35 +1070,43 @@ app.get('/api/dashboard', requireAuth, (req, res) => {
     const myAssign = db.prepare('SELECT * FROM teacher_assignments WHERE teacher_id=?').all(req.session.teacherId);
     const myStudents = my.length ? db.prepare("SELECT COUNT(*) c FROM students WHERE status='active' AND class_name IN (" + my.map(() => '?').join(',') + ')').get(...my).c : 0;
     const att = my.length ? db.prepare('SELECT status, COUNT(*) c FROM attendance WHERE date=? AND class_name IN (' + my.map(() => '?').join(',') + ') GROUP BY status').all(today, ...my) : [];
-    const present = (att.find(a => a.status === 'Present') || { c: 0 }).c;
+    const present = presentCount(att);
+    const late = lateCount(att);
     const prof = teacherProfile(req.session.teacherId);
     const staffAtt = db.prepare('SELECT * FROM staff_attendance WHERE teacher_id=? ORDER BY date DESC LIMIT 30').all(req.session.teacherId);
-    const attPct = staffAtt.length ? Math.round(staffAtt.filter(a => a.status === 'Present').length / staffAtt.length * 1000) / 10 : 0;
-    return res.json({ role, today, month, myClasses: my, mySubjects: [...new Set(myAssign.map(a => a.subject))], myStudents, present, attendance: att, progress: prof ? prof.progress : [], attPct, teacherName: prof ? prof.name : '' });
+    const attPct = staffAtt.length ? Math.round(staffAtt.filter(a => isPresentStatus(a.status)).length / staffAtt.length * 1000) / 10 : 0;
+    return res.json({ role, today, month, myClasses: my, mySubjects: [...new Set(myAssign.map(a => a.subject))], myStudents, present, late, attendance: att, progress: prof ? prof.progress : [], attPct, teacherName: prof ? prof.name : '' });
   }
   if (role === 'parent') {
     const prof = studentProfile(req.session.studentId);
     if (!prof) return res.status(404).json({ error: 'Child not found' });
     const attTotal = prof.attendance.length;
-    const attPresent = prof.attendance.filter(a => a.status === 'Present').length;
+    // Late counts as present: a late child still attended that day.
+    const attPresent = prof.attendance.filter(a => isPresentStatus(a.status)).length;
+    const attLate = prof.attendance.filter(a => a.status === 'Late').length;
     const feesTotal = prof.fees.reduce((a, f) => a + f.amount, 0);
     const feesPaid = prof.fees.reduce((a, f) => a + f.paid, 0);
     const totalMarks = prof.results.reduce((a, r) => a + r.marks, 0), totalOf = prof.results.reduce((a, r) => a + r.total_marks, 0);
     const pct = totalOf ? Math.round(totalMarks / totalOf * 1000) / 10 : 0;
-    return res.json({ role, today, month, child: { id: prof.id, name: prof.name, class_name: prof.class_name, section: prof.section, roll_no: prof.roll_no, father_name: prof.father_name }, attPct: attTotal ? Math.round(attPresent / attTotal * 1000) / 10 : 0, attTotal, attPresent, feesTotal, feesPaid, feesPending: feesTotal - feesPaid, resultPct: pct, grade: grade(pct) });
+    const unreadCount = db.prepare('SELECT COUNT(*) c FROM notifications WHERE student_id=? AND is_read=0').get(req.session.studentId).c;
+    return res.json({ role, today, month, child: { id: prof.id, name: prof.name, class_name: prof.class_name, section: prof.section, roll_no: prof.roll_no, father_name: prof.father_name }, attPct: attTotal ? Math.round(attPresent / attTotal * 1000) / 10 : 0, attTotal, attPresent, attLate, feesTotal, feesPaid, feesPending: feesTotal - feesPaid, resultPct: pct, grade: grade(pct), unreadCount });
   }
   const total = db.prepare("SELECT COUNT(*) c FROM students WHERE status='active'").get().c;
   const totalAll = db.prepare('SELECT COUNT(*) c FROM students').get().c;
   const att = db.prepare('SELECT status, COUNT(*) c FROM attendance WHERE date=? GROUP BY status').all(today);
-  const present = (att.find(a => a.status === 'Present') || { c: 0 }).c;
+  // Late counts as present: Present Today = Present + Late.
+  const present = presentCount(att);
+  const late = lateCount(att);
   const fees = db.prepare('SELECT COALESCE(SUM(amount),0) total, COALESCE(SUM(paid),0) collected FROM fees WHERE month=?').get(month);
   const pending = db.prepare("SELECT COUNT(*) c FROM fees WHERE month=? AND status!='paid'").get(month).c;
   const teachers = db.prepare('SELECT COUNT(*) c FROM teachers').get().c;
-  const staffPresent = db.prepare("SELECT COUNT(*) c FROM staff_attendance WHERE date=? AND status='Present'").get(today).c;
+  const staffAttToday = db.prepare('SELECT status, COUNT(*) c FROM staff_attendance WHERE date=? GROUP BY status').all(today);
+  const staffPresent = presentCount(staffAttToday);
+  const staffLate = lateCount(staffAttToday);
   const left = db.prepare('SELECT COUNT(*) c FROM leaving_records').get().c;
   const promoted = db.prepare('SELECT COUNT(*) c FROM promotions').get().c;
   const byClass = db.prepare("SELECT class_name, COUNT(*) c FROM students WHERE status='active' GROUP BY class_name").all();
-  res.json({ role, total, totalAll, today, month, present, attendance: att, feesTotal: fees.total, feesCollected: fees.collected, feesPending: fees.total - fees.collected, feesPendingCount: pending, teachers, staffPresent, left, promoted, byClass });
+  res.json({ role, total, totalAll, today, month, present, late, attendance: att, feesTotal: fees.total, feesCollected: fees.collected, feesPending: fees.total - fees.collected, feesPendingCount: pending, teachers, staffPresent, staffLate, left, promoted, byClass });
 });
 
 // students
@@ -1083,12 +1237,32 @@ app.post('/api/attendance', requireRole('admin', 'teacher'), (req, res) => {
   }
   const ins = db.prepare('INSERT INTO attendance (student_id,date,status,class_name) VALUES (?,?,?,?) ON CONFLICT(student_id,date) DO UPDATE SET status=excluded.status');
   for (const r of prepared) ins.run(r.student_id, date, r.status, r.class_name);
+  // Parent notification: Absent/Late creates one (one per student+date);
+  // correcting it back to Present/Leave clears that day's notification.
+  // Repeated-late rule (status count only): 4th Late in a month, and every
+  // Late after that in the same month, notifies the parent again.
+  for (const r of prepared) {
+    if (r.status === 'Absent' || r.status === 'Late') notifyAbsence(r.student_id, r.status, date);
+    else clearNotification(r.student_id, 'absence', date);
+    if (r.status === 'Late') notifyRepeatedLate(r.student_id, date);
+    else clearNotification(r.student_id, 'late', String(date).slice(0, 7) + ':' + date);
+  }
   res.json({ ok: true, saved: prepared.length });
+});
+// Late counts for a month (admin only): who was late, how many times,
+// last late date. The Attendance tab shows this so admin can see at a
+// glance whose parents were notified (4+ lates = notified, then every
+// late after that notifies again). Counting is by Late status only.
+app.get('/api/attendance/late-counts', requireAdmin, (req, res) => {
+  const { month } = req.query;
+  if (!month || !/^\d{4}-\d{2}$/.test(month)) return res.status(400).json({ error: 'month required (YYYY-MM)' });
+  const rows = db.prepare("SELECT a.student_id, s.name, s.class_name, COUNT(*) lateCount, MAX(a.date) lastLate FROM attendance a JOIN students s ON s.id=a.student_id WHERE substr(a.date,1,7)=? AND a.status='Late' GROUP BY a.student_id, s.name, s.class_name ORDER BY lateCount DESC, s.name").all(month);
+  res.json(rows);
 });
 app.get('/api/attendance/summary', requireAuth, (req, res) => {
   const { month, class: cls } = req.query;
   if (!month) return res.status(400).json({ error: 'month required (YYYY-MM)' });
-  let rows = db.prepare("SELECT student_id, COUNT(*) total, SUM(CASE WHEN status='Present' THEN 1 ELSE 0 END) present FROM attendance WHERE substr(date,1,7)=? GROUP BY student_id").all(month);
+  let rows = db.prepare("SELECT student_id, COUNT(*) total, SUM(CASE WHEN status IN ('Present','Late') THEN 1 ELSE 0 END) present, SUM(CASE WHEN status='Late' THEN 1 ELSE 0 END) late FROM attendance WHERE substr(date,1,7)=? GROUP BY student_id").all(month);
   const role = req.session.role || 'admin';
   if (role === 'parent') rows = rows.filter(r => r.student_id === req.session.studentId);
   if (role === 'teacher') {
@@ -1096,7 +1270,7 @@ app.get('/api/attendance/summary', requireAuth, (req, res) => {
     const ids = new Set(db.prepare("SELECT id FROM students WHERE class_name IN (" + my.map(() => '?').join(',') + ')').all(...my).map(x => x.id));
     rows = rows.filter(r => ids.has(r.student_id));
   }
-  res.json(rows.map(r => ({ student_id: r.student_id, total: r.total, present: r.present, pct: r.total ? Math.round(r.present / r.total * 1000) / 10 : 0 })));
+  res.json(rows.map(r => ({ student_id: r.student_id, total: r.total, present: r.present, late: r.late || 0, pct: r.total ? Math.round(r.present / r.total * 1000) / 10 : 0 })));
 });
 
 // fees
@@ -1113,7 +1287,11 @@ app.post('/api/fees/generate', requireAdmin, (req, res) => {
   const students = db.prepare('SELECT id, monthly_fee FROM students').all();
   const ins = db.prepare('INSERT OR IGNORE INTO fees (student_id,month,amount,paid,status) VALUES (?,?,?,0,?)');
   let n = 0; for (const s of students) { const r = ins.run(s.id, month, s.monthly_fee, 'pending'); if (r.changes) n++; }
-  res.json({ ok: true, created: n, month });
+  // Parent notification: every newly created pending challan notifies
+  // that student's parent (only students who have a parent account).
+  let notified = 0;
+  for (const s of students) notified += notifyFeePending(s.id, month);
+  res.json({ ok: true, created: n, month, notified });
 });
 app.post('/api/fees/:id/pay', requireAdmin, (req, res) => {
   const { amount, method } = req.body || {};
@@ -1123,6 +1301,8 @@ app.post('/api/fees/:id/pay', requireAdmin, (req, res) => {
   const status = paid === 0 ? 'pending' : paid >= f.amount ? 'paid' : 'partial';
   db.prepare('UPDATE fees SET paid=?, status=?, payment_method=?, payment_date=? WHERE id=?')
     .run(paid, status, method || f.payment_method || 'Cash', new Date().toISOString().slice(0, 10), req.params.id);
+  // Fully paid: the pending-fee notification for this student+month is done.
+  if (status === 'paid') clearNotification(f.student_id, 'fee', f.month);
   res.json({ ok: true, paid, status });
 });
 
@@ -1145,6 +1325,9 @@ app.get('/api/results', requireAuth, (req, res) => {
 app.post('/api/results', requireRole('admin', 'teacher'), (req, res) => {
   const b = req.body || {};
   if (!b.student_id || !b.exam || !b.subject) return res.status(400).json({ error: 'student, exam and subject required' });
+  // Exam must be one of the three terms — the form offers only these in a
+  // dropdown (no free text). Old "Mid Term 2026" results already match.
+  if (!EXAM_OPTIONS.includes(b.exam)) return res.status(400).json({ error: 'Exam sirf in teen mein se ho sakta hai: ' + EXAM_OPTIONS.join(', ') });
   const marks = Number(b.marks), totalMarks = Number(b.total_marks) || 100;
   if (!Number.isFinite(marks) || marks < 0 || marks > totalMarks) return res.status(400).json({ error: 'Marks must be between 0 and total marks (' + totalMarks + ')' });
   const st = db.prepare('SELECT * FROM students WHERE id=?').get(b.student_id);
@@ -1160,11 +1343,75 @@ app.post('/api/results', requireRole('admin', 'teacher'), (req, res) => {
   }
   db.prepare('INSERT INTO results (student_id,exam,subject,marks,total_marks,class_name) VALUES (?,?,?,?,?,?) ON CONFLICT(student_id,exam,subject,class_name) DO UPDATE SET marks=excluded.marks, total_marks=excluded.total_marks')
     .run(b.student_id, b.exam, b.subject, marks, totalMarks, resultClass);
+  // Parent notification: result published for this student+exam (one row
+  // per exam — adding more subjects for the same exam does not re-notify).
+  notifyResultPublished(b.student_id, b.exam);
   res.json({ ok: true, class_name: resultClass });
 });
 app.delete('/api/results/:id', requireAdmin, (req, res) => {
   db.prepare('DELETE FROM results WHERE id=?').run(req.params.id);
   res.json({ ok: true });
+});
+
+// ---------- parent notifications API (in-system only) ----------
+// Scoping is the whole point: a parent sees ONLY rows for their own child
+// (student_id = their linked student). Admin sees the full log. Teachers
+// have no parent notifications — 403.
+app.get('/api/notifications', requireAuth, (req, res) => {
+  const role = req.session.role || 'admin';
+  if (role === 'teacher') return res.status(403).json({ error: 'Teachers have no parent notifications' });
+  const { type } = req.query;
+  if (role === 'parent') {
+    if (!req.session.studentId) return res.status(403).json({ error: 'No child linked to this parent account' });
+    let sql = 'SELECT n.*, s.name student_name, s.class_name FROM notifications n JOIN students s ON s.id=n.student_id WHERE n.student_id=?';
+    const p = [req.session.studentId];
+    if (type) { sql += ' AND n.type=?'; p.push(type); }
+    const rows = db.prepare(sql + ' ORDER BY n.created_at DESC, n.id DESC').all(...p);
+    const unread = db.prepare('SELECT COUNT(*) c FROM notifications WHERE student_id=? AND is_read=0').get(req.session.studentId).c;
+    return res.json({ notifications: rows, unreadCount: unread });
+  }
+  let sql = 'SELECT n.*, s.name student_name, s.class_name, u.username parent_username FROM notifications n JOIN students s ON s.id=n.student_id LEFT JOIN users u ON u.id=n.parent_user_id WHERE 1=1';
+  const p = [];
+  if (type) { sql += ' AND n.type=?'; p.push(type); }
+  if (req.query.student_id) { sql += ' AND n.student_id=?'; p.push(Number(req.query.student_id)); }
+  const rows = db.prepare(sql + ' ORDER BY n.created_at DESC, n.id DESC LIMIT 500').all(...p);
+  const unread = db.prepare('SELECT COUNT(*) c FROM notifications WHERE is_read=0').get().c;
+  res.json({ notifications: rows, unreadCount: unread, total: rows.length });
+});
+app.post('/api/notifications', requireAdmin, (req, res) => {
+  const b = req.body || {};
+  const studentId = Number(b.student_id);
+  const message = String(b.message || '').trim();
+  if (!studentId || !message) return res.status(400).json({ error: 'Student aur message dono zaroori hain' });
+  const s = db.prepare('SELECT id, name FROM students WHERE id=?').get(studentId);
+  if (!s) return res.status(404).json({ error: 'Student not found' });
+  const title = String(b.title || '').trim() || 'Message from school — ' + s.name;
+  const refKey = 'manual-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+  // Manual send: always created (onlyIfParent=false) — the notification
+  // stays inside the system and shows in that parent's login only.
+  const changes = createNotification(studentId, 'manual', title, message, refKey, { onlyIfParent: false, related_date: new Date().toISOString().slice(0, 10) });
+  if (!changes) return res.status(400).json({ error: 'Notification save nahi ho saki' });
+  res.json({ ok: true, student: s.name });
+});
+app.post('/api/notifications/:id/read', requireAuth, (req, res) => {
+  const role = req.session.role || 'admin';
+  if (role === 'teacher') return res.status(403).json({ error: 'Teachers have no parent notifications' });
+  const n = db.prepare('SELECT * FROM notifications WHERE id=?').get(req.params.id);
+  if (!n) return res.status(404).json({ error: 'Not found' });
+  if (role === 'parent' && n.student_id !== req.session.studentId) return res.status(403).json({ error: 'You can only read your own child notifications' });
+  db.prepare('UPDATE notifications SET is_read=1 WHERE id=?').run(req.params.id);
+  res.json({ ok: true });
+});
+app.post('/api/notifications/read-all', requireAuth, (req, res) => {
+  const role = req.session.role || 'admin';
+  if (role === 'teacher') return res.status(403).json({ error: 'Teachers have no parent notifications' });
+  if (role === 'parent') {
+    if (!req.session.studentId) return res.status(403).json({ error: 'No child linked to this parent account' });
+    const r = db.prepare('UPDATE notifications SET is_read=1 WHERE student_id=? AND is_read=0').run(req.session.studentId);
+    return res.json({ ok: true, marked: r.changes });
+  }
+  const r = db.prepare('UPDATE notifications SET is_read=1 WHERE is_read=0').run();
+  res.json({ ok: true, marked: r.changes });
 });
 
 // teachers & staff
@@ -1298,9 +1545,9 @@ app.get('/api/staff-attendance/summary', requireAuth, (req, res) => {
   let teachers = db.prepare('SELECT id, name, designation FROM teachers ORDER BY name').all();
   if (role === 'teacher') teachers = teachers.filter(t => t.id === req.session.teacherId);
   const rows = teachers.map(t => {
-    const r = db.prepare("SELECT COUNT(*) total, SUM(CASE WHEN status='Present' THEN 1 ELSE 0 END) present FROM staff_attendance WHERE teacher_id=? AND substr(date,1,7)=?").get(t.id, month);
+    const r = db.prepare("SELECT COUNT(*) total, SUM(CASE WHEN status IN ('Present','Late') THEN 1 ELSE 0 END) present, SUM(CASE WHEN status='Late' THEN 1 ELSE 0 END) late FROM staff_attendance WHERE teacher_id=? AND substr(date,1,7)=?").get(t.id, month);
     const total = r.total || 0, present = r.present || 0;
-    return { teacher_id: t.id, name: t.name, designation: t.designation, total, present, pct: total ? Math.round(present / total * 1000) / 10 : 0 };
+    return { teacher_id: t.id, name: t.name, designation: t.designation, total, present, late: r.late || 0, pct: total ? Math.round(present / total * 1000) / 10 : 0 };
   });
   res.json(rows);
 });
