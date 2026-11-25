@@ -55,6 +55,8 @@ async function checkLogin() {
   $('#appView').classList.toggle('hidden', !me.loggedIn);
   if (me.loggedIn) {
     $('#schoolTitle').textContent = me.schoolName + ' — School Management System';
+    const heroTitle = $('#heroTitle'); if (heroTitle) heroTitle.textContent = me.schoolName;
+    const heroDate = $('#heroDate'); if (heroDate) heroDate.textContent = new Date($('#todayInput').value + 'T00:00:00').toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' });
     $('#userLine').textContent = 'Logged in as ' + me.username + ' (' + (me.role || 'admin') + ')';
     if (!tabsFor().some(([k]) => k === tab)) tab = 'dashboard';
     renderTabs(); loadDashboard();
@@ -74,7 +76,17 @@ $('#registerBtn').onclick = async () => {
 };
 $('#logoutBtn').onclick = async () => { await api('/api/logout', { method: 'POST' }); checkLogin(); };
 $('#refreshBtn').onclick = () => loadTab(tab);
-function renderTabs() { const tabs = tabsFor(); $('#tabs').innerHTML = tabs.map(([k, l]) => `<button data-t="${k}" class="${k===tab?'active':''}">${l}</button>`).join(''); document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => { tab = b.dataset.t; renderTabs(); loadTab(tab); }); }
+function renderTabs() {
+  const tabs = tabsFor();
+  $('#tabs').innerHTML = tabs.map(([k, l]) => `<button data-t="${k}" class="${k===tab?'active':''}">${l}</button>`).join('');
+  document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => { tab = b.dataset.t; renderTabs(); loadTab(tab); });
+  // Fixed bottom nav (mobile): same tabs, so every section is one tap away on phone.
+  const nav = $('#bottomNav');
+  if (nav) {
+    nav.innerHTML = tabs.map(([k, l]) => `<button data-t="${k}" class="${k===tab?'active':''}">${l}</button>`).join('');
+    nav.querySelectorAll('button').forEach(b => b.onclick = () => { tab = b.dataset.t; renderTabs(); loadTab(tab); window.scrollTo({ top: 0, behavior: 'smooth' }); });
+  }
+}
 function loadTab(t) { ({ dashboard: loadDashboard, students: loadStudents, attendance: loadAttendance, fees: loadFees, results: loadResults, teachers: loadTeachers, timetable: loadTimetable, leaving: loadLeaving, backup: loadBackup })[t](); }
 
 async function loadDashboard() {

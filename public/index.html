@@ -1,9 +1,17 @@
 <!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>School Management System — Online</title><link rel="stylesheet" href="style.css"></head>
+<title>School Management System — Online</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:wght@600;700&family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css"></head>
 <body>
-<div id="loginView" class="login-wrap">
-  <h2>🏫 School Management System</h2>
+<div id="loginView" class="login-page"><div class="login-wrap">
+  <div class="login-brand">
+    <div class="brand-mark">🏫</div>
+    <h2>School Management System</h2>
+    <p>Attendance • Fees • Results • Teachers — sab ek jagah.</p>
+  </div>
+  <div class="login-body">
   <p>School login — apna role chunein, phir login karein.</p>
   <label>I am logging in as</label>
   <div id="rolePick" style="display:flex;gap:6px;margin-bottom:6px">
@@ -26,13 +34,19 @@
   <div style="display:flex;gap:8px;margin-top:14px"><button id="loginBtn" style="flex:1">Login</button><button id="registerBtn" class="secondary" style="flex:1">Create Account</button></div>
   <p id="loginMsg" style="color:#b91c1c"></p>
   <p style="font-size:13px;color:#64748b">Data server-side SQLite database mein save hota hai — browser band karne par bhi data rehta hai. Teacher sirf apni classes dekh sakta hai, parent sirf apna bacha — fees aur salaries sirf admin dekh sakta hai.</p>
-</div>
+  </div>
+</div></div>
 
 <div id="appView" class="hidden">
 <header><div><h1>🏫 <span id="schoolTitle">School Management System</span></h1><small id="userLine"></small></div>
 <div><button id="logoutBtn" class="secondary">Logout</button></div></header>
 <div class="container">
-  <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+  <div class="hero">
+    <span class="hero-eyebrow"><span class="pulse-dot"></span> Live today &nbsp;•&nbsp; <span id="heroDate">25 November 2026</span></span>
+    <h2 id="heroTitle">School Management System</h2>
+    <p>Attendance, fees, results aur teachers — poora school, ek dashboard par.</p>
+  </div>
+  <div class="toolbar">
     <label style="margin:0">Date <input type="date" id="todayInput" value="2026-11-25" style="width:auto"></label>
     <label style="margin:0">Month <input type="month" id="monthInput" value="2026-11" style="width:auto"></label>
     <button id="refreshBtn" class="secondary">Refresh</button>
@@ -41,6 +55,7 @@
   <div class="tabs" id="tabs"></div>
   <div id="view"></div>
 </div>
+<nav class="bottom-nav" id="bottomNav" aria-label="Sections"></nav>
 </div>
 <div id="modal" class="modal hidden"><div id="modalBody"></div></div>
 <script src="app.js"></script>
