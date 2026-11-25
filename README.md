@@ -140,9 +140,35 @@ all data is saved on the server in `data/school.db` via the Express API.
     "— Free". On a phone it scrolls sideways with clear headers.
 - **Leaving / Promoted** — leaving record (date, reason, last class, SLC number);
   promotion history (from → to class, exam, percentage).
-- **Timetable** — all 12 classes, Mon–Sat, 6 periods + break, teacher + subject
+- **Timetable** — all 12 classes, Mon–Sat, periods + break, teacher + subject
   + time, auto-generated from teacher assignments; each teacher's own weekly
   timetable is in their profile. Regenerate any time.
+  - **Full admin editor (click any box):** admin kisi bhi period ke box par
+    click kare — bhara hua ho ya Free — to edit panel khulta hai: Subject
+    (is class ke subjects), Teacher (sirf wohi teachers jo us Day+Period
+    mein koi class nahi parha rahe AUR us subject ke hon — busy ya
+    chhuti wale list mein aate hi nahi), Start/End time, Save / Set Free /
+    Cancel. Server save par dobara check karta hai (qualified + free + no
+    double-booking) aur warna Roman Urdu error deta hai. APIs:
+    `GET /api/timetable?class=&date=`, `POST /api/timetable/period`
+    (start_time/end_time bhi le sakta hai — time slot-wide badalta hai).
+  - **Periods per day + slot times (admin, server-side saved):** Timetable
+    Settings mein periods per day 4–8 chunein (default 6) aur har period ka
+    start/end time badlein — time poore hafte ki us period ke liye badalta
+    hai. Zyada periods Free add hote hain, kam karne par aakhri periods hat
+    jate hain; grid, break row aur times foran update hote hain. Settings
+    database mein save hoti hain, restart/redeploy ke baad bhi rehti hain.
+    APIs: `GET /api/timetable/settings`, `POST /api/timetable/settings`.
+  - **Teacher on leave = Free for a substitute:** Timetable tab mein date
+    chunein (default aaj) — us date ko jo teacher Staff Attendance mein
+    Leave/Absent hai, us ki periods “Free — chhuti” dikhti hain (original
+    teacher ka naam ke saath). Box par click karke substitute chunein —
+    substitute **sirf us date** ke liye lagta hai (weekly timetable nahi
+    badalta), aur substitute Period 1 ka ho to wohi us din ki attendance
+    bhi laga sakta hai; substitute na ho to us din sirf admin attendance
+    laga sakta hai. API: `POST /api/timetable/substitute`
+    (teacher_id null = substitute hatayein). `GET /api/timetable/available`
+    mein `?date=` bhi hai — chhuti wale teacher available nahi hote.
 - **Timetable rule (no double-booking):** a teacher can teach at most ONE class
   in the same Day + Period slot. Subjects are staggered by class so different
   classes need different subjects at the same time; if the teacher for a

@@ -88,6 +88,22 @@ CREATE TABLE IF NOT EXISTS timetable (
   subject TEXT NOT NULL, teacher_id INTEGER, start_time TEXT NOT NULL, end_time TEXT NOT NULL,
   UNIQUE(class_name, day, period)
 );
+-- Admin timetable settings: periods per day (4-8, default 6) and the
+-- start/end time of each period slot (slot-wide, across the whole week).
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+-- Date-specific substitute assignments: when a teacher is on leave for
+-- one date, admin can assign a substitute for that date ONLY — the weekly
+-- timetable itself is not changed. UNIQUE(class, date, period).
+CREATE TABLE IF NOT EXISTS timetable_overrides (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  class_name TEXT NOT NULL, day TEXT NOT NULL, period INTEGER NOT NULL,
+  date TEXT NOT NULL, teacher_id INTEGER, subject TEXT NOT NULL,
+  start_time TEXT NOT NULL, end_time TEXT NOT NULL,
+  UNIQUE(class_name, date, period)
+);
 `);
 
 // ---------- helpers ----------
@@ -189,6 +205,77 @@ function cleanTeacherAssignments() {
   } catch (e) { console.log('cleanTeacherAssignments skipped: ' + e.message); return 0; }
 }
 
+// ---------- timetable settings: periods per day + slot times ----------
+// Admin-only, stored server-side in the settings table so they survive
+// restart / redeploy. periods_per_day 4-8 (default 6). period_times is a
+// JSON array of [start, end] pairs for slots 1-8; a slot's time applies to
+// that period number across the whole week (all classes, all days).
+// Break is after Period 3 whenever periods_per_day >= 4.
+const DEFAULT_PERIOD_TIMES = [['08:00', '08:45'], ['08:45', '09:30'], ['09:30', '10:15'], ['10:45', '11:30'], ['11:30', '12:15'], ['12:15', '13:00'], ['13:00', '13:45'], ['13:45', '14:30']];
+const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+function ensureSettings() {
+  db.prepare("INSERT OR IGNORE INTO settings (key,value) VALUES ('periods_per_day','6'),('period_times',?)").run(JSON.stringify(DEFAULT_PERIOD_TIMES));
+}
+function getSetting(key) { const r = db.prepare('SELECT value FROM settings WHERE key=?').get(key); return r ? r.value : null; }
+function getPeriodsPerDay() {
+  const n = Number(getSetting('periods_per_day'));
+  return Number.isFinite(n) && n >= 4 && n <= 8 ? Math.floor(n) : 6;
+}
+function getPeriodTimes() {
+  try {
+    const t = JSON.parse(getSetting('period_times') || 'null');
+    if (Array.isArray(t) && t.length >= 8 && t.every(x => Array.isArray(x) && TIME_RE.test(x[0]) && TIME_RE.test(x[1]) && x[0] < x[1])) return t;
+  } catch (e) { /* fall through to default */ }
+  return DEFAULT_PERIOD_TIMES.map(x => [...x]);
+}
+function periodTimeFor(p) { return getPeriodTimes()[p - 1] || DEFAULT_PERIOD_TIMES[p - 1]; }
+function getTimetableSettings() {
+  const ppd = getPeriodsPerDay();
+  return { periodsPerDay: ppd, periodTimes: getPeriodTimes().slice(0, ppd).map((t, i) => ({ period: i + 1, start: t[0], end: t[1] })), breakAfter: ppd >= 4 ? 3 : 0 };
+}
+// Change one slot's time across the whole week (settings + every row of
+// that period number). Used by the click-to-edit panel and the settings
+// editor — a period's time is a slot property, not a per-cell property.
+function updateSlotTime(period, start, end) {
+  const times = getPeriodTimes();
+  times[period - 1] = [start, end];
+  db.prepare("INSERT INTO settings (key,value) VALUES ('period_times',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(JSON.stringify(times));
+  db.prepare('UPDATE timetable SET start_time=?, end_time=? WHERE period=?').run(start, end, period);
+}
+// Apply new settings: store them, drop rows above the new period count,
+// refresh every remaining row's times to the slot times, and insert any
+// missing rows (new periods) as Free. Subjects/teachers of kept rows are
+// never touched.
+function setTimetableSettings(periodsPerDay, periodTimes) {
+  const ppd = Math.max(4, Math.min(8, Math.floor(periodsPerDay) || 6));
+  const times = getPeriodTimes();
+  if (Array.isArray(periodTimes)) periodTimes.forEach((t, i) => { if (i < 8 && Array.isArray(t) && TIME_RE.test(t[0]) && TIME_RE.test(t[1]) && t[0] < t[1]) times[i] = [t[0], t[1]]; });
+  db.prepare("INSERT INTO settings (key,value) VALUES ('periods_per_day',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(String(ppd));
+  db.prepare("INSERT INTO settings (key,value) VALUES ('period_times',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(JSON.stringify(times));
+  db.prepare('DELETE FROM timetable WHERE period>?').run(ppd);
+  for (let p = 1; p <= ppd; p++) db.prepare('UPDATE timetable SET start_time=?, end_time=? WHERE period=?').run(times[p - 1][0], times[p - 1][1], p);
+  const addFree = db.prepare('INSERT OR IGNORE INTO timetable (class_name,day,period,subject,teacher_id,start_time,end_time) VALUES (?,?,?,?,NULL,?,?)');
+  for (const cls of CLASSES) for (const day of TT_DAYS) for (let p = 1; p <= ppd; p++) addFree.run(cls, day, p, 'Free', times[p - 1][0], times[p - 1][1]);
+  return { periodsPerDay: ppd, filled: db.prepare("SELECT COUNT(*) c FROM timetable WHERE subject<>'Free'").get().c, free: db.prepare("SELECT COUNT(*) c FROM timetable WHERE subject='Free'").get().c, total: db.prepare('SELECT COUNT(*) c FROM timetable').get().c };
+}
+// Keep the stored timetable matching the settings (row count + slot
+// times) without touching subjects/teachers. Runs on startup so an old
+// database (6 periods) follows a settings change made before a restart.
+function syncTimetableShape() {
+  try {
+    const ppd = getPeriodsPerDay();
+    const times = getPeriodTimes();
+    db.prepare('DELETE FROM timetable WHERE period>?').run(ppd);
+    for (let p = 1; p <= ppd; p++) db.prepare('UPDATE timetable SET start_time=?, end_time=? WHERE period=?').run(times[p - 1][0], times[p - 1][1], p);
+    let added = 0;
+    for (const cls of CLASSES) for (const day of TT_DAYS) for (let p = 1; p <= ppd; p++) {
+      const r = db.prepare('INSERT OR IGNORE INTO timetable (class_name,day,period,subject,teacher_id,start_time,end_time) VALUES (?,?,?,?,NULL,?,?)').run(cls, day, p, 'Free', times[p - 1][0], times[p - 1][1]);
+      if (r.changes) added++;
+    }
+    if (added) console.log('syncTimetableShape: added ' + added + ' missing Free period row(s) for periods_per_day=' + ppd);
+  } catch (e) { console.log('syncTimetableShape skipped: ' + e.message); }
+}
+
 // ---------- conflict-free timetable builder ----------
 // FAULT FIXED: the old builder gave every class the SAME subject in the
 // same Day+Period slot (identical rotation for all classes) and picked the
@@ -211,7 +298,9 @@ function cleanTeacherAssignments() {
 //     slots/week, so some English periods must be Free until the school
 //     hires another English teacher.
 const TT_DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-const TT_TIMES = [['08:00', '08:45'], ['08:45', '09:30'], ['09:30', '10:15'], ['10:45', '11:30'], ['11:30', '12:15'], ['12:15', '13:00']];
+// Slot times come from settings (see getPeriodTimes() above) — TT_TIMES
+// is only the default for a fresh database.
+const TT_TIMES = DEFAULT_PERIOD_TIMES;
 function buildTimetableRows() {
   const primary = teacherPrimaryMap();
   // Only assignments in the teacher's OWN subject count — a polluted
@@ -227,8 +316,9 @@ function buildTimetableRows() {
     if (!bySubject.get(a.subject).includes(a.teacher_id)) bySubject.get(a.subject).push(a.teacher_id);
   }
   const rows = []; let filled = 0, free = 0;
+  const ppd = getPeriodsPerDay();
   TT_DAYS.forEach((day, di) => {
-    for (let p = 1; p <= 6; p++) {
+    for (let p = 1; p <= ppd; p++) {
       const slotBooked = new Set();
       // Rotate class order per slot so no class always gets first pick.
       const order = CLASSES.map((c, i) => CLASSES[(i + di * 6 + p) % CLASSES.length]);
@@ -241,8 +331,9 @@ function buildTimetableRows() {
           ...(bySubject.get(subj) || []),
         ];
         const teacherId = candidates.find(id => !slotBooked.has(id)) || null;
-        if (teacherId) { slotBooked.add(teacherId); filled++; rows.push({ class_name: cls, day, period: p, subject: subj, teacher_id: teacherId, start_time: TT_TIMES[p - 1][0], end_time: TT_TIMES[p - 1][1] }); }
-        else { free++; rows.push({ class_name: cls, day, period: p, subject: 'Free', teacher_id: null, start_time: TT_TIMES[p - 1][0], end_time: TT_TIMES[p - 1][1] }); }
+        const tm = periodTimeFor(p);
+        if (teacherId) { slotBooked.add(teacherId); filled++; rows.push({ class_name: cls, day, period: p, subject: subj, teacher_id: teacherId, start_time: tm[0], end_time: tm[1] }); }
+        else { free++; rows.push({ class_name: cls, day, period: p, subject: 'Free', teacher_id: null, start_time: tm[0], end_time: tm[1] }); }
       }
     }
   });
@@ -275,7 +366,10 @@ function fixTimetableConflicts() {
   try {
     const extra = countTimetableConflicts();
     const badSubject = countTimetableSubjectFaults();
-    if (!extra && !badSubject) return 0;
+    const expected = CLASSES.length * TT_DAYS.length * getPeriodsPerDay();
+    const shapeBad = db.prepare('SELECT COUNT(*) c FROM timetable').get().c !== expected;
+    if (!extra && !badSubject && !shapeBad) return 0;
+    if (shapeBad && !extra && !badSubject) { syncTimetableShape(); return 0; }
     console.log('fixTimetableConflicts: ' + extra + ' double-booked row(s), ' + badSubject + ' wrong-subject row(s) found — rebuilding timetable');
     db.prepare('DELETE FROM timetable').run();
     const { rows, filled, free } = buildTimetableRows();
@@ -407,14 +501,46 @@ function dayNameOf(dateStr) {
   if (isNaN(d)) return null;
   return TT_DAY_NAMES[d.getDay()];
 }
+// ---- Teacher on leave = Free for a substitute (date-specific) ----
+// staff_attendance status 'Leave' (or 'Absent') on a date means that
+// teacher cannot teach that day: their timetable slots for that date show
+// as Free (on leave) and admin may assign a substitute teacher for that
+// date only (timetable_overrides) — the weekly timetable is not changed.
+// A substitute who holds Period 1 for that date IS the Period 1 teacher
+// for attendance that day; with no substitute, only admin can mark it.
+function leaveMapFor(dateStr) {
+  const m = new Map();
+  for (const r of db.prepare("SELECT teacher_id, status FROM staff_attendance WHERE date=? AND status IN ('Leave','Absent')").all(dateStr)) m.set(r.teacher_id, r.status);
+  return m;
+}
+function getOverride(className, dateStr, period) {
+  return db.prepare('SELECT ov.*, t.name teacher_name FROM timetable_overrides ov LEFT JOIN teachers t ON t.id=ov.teacher_id WHERE ov.class_name=? AND ov.date=? AND ov.period=?').get(className, dateStr, period) || null;
+}
+// Effective (date-aware) version of one weekly timetable row: override
+// wins, then on-leave turns the slot Free. Returns the row with extra
+// fields onLeave / substitute / original_teacher_name.
+function effectiveRow(row, dateStr) {
+  if (!dateStr) return row;
+  const ov = getOverride(row.class_name, dateStr, row.period);
+  if (ov) return { ...row, teacher_id: ov.teacher_id, teacher_name: ov.teacher_name, subject: ov.subject, start_time: ov.start_time, end_time: ov.end_time, substitute: true, onLeave: false, original_teacher_id: row.teacher_id, original_teacher_name: row.teacher_name };
+  if (row.teacher_id && leaveMapFor(dateStr).has(row.teacher_id)) return { ...row, teacher_id: null, teacher_name: null, subject: 'Free', onLeave: true, substitute: false, original_teacher_id: row.teacher_id, original_teacher_name: row.teacher_name, original_subject: row.subject, leaveStatus: leaveMapFor(dateStr).get(row.teacher_id) };
+  return row;
+}
 function period1Teacher(className, dateStr) {
   const day = dayNameOf(dateStr);
   if (!day) return null;
-  return db.prepare('SELECT tt.*, t.name teacher_name FROM timetable tt LEFT JOIN teachers t ON t.id=tt.teacher_id WHERE tt.class_name=? AND tt.day=? AND tt.period=1').get(className, day) || null;
+  const base = db.prepare('SELECT tt.*, t.name teacher_name FROM timetable tt LEFT JOIN teachers t ON t.id=tt.teacher_id WHERE tt.class_name=? AND tt.day=? AND tt.period=1').get(className, day) || null;
+  if (!base) return null;
+  const eff = effectiveRow(base, dateStr);
+  if (eff.substitute) return { ...eff, substitute: true };
+  if (eff.onLeave) return { ...base, teacher_id: null, teacher_name: base.teacher_name, onLeave: true, leaveStatus: eff.leaveStatus };
+  return base;
 }
 function period1Error(className, dateStr) {
   const p1 = period1Teacher(className, dateStr);
   if (!p1) return 'Sirf 1st period wale teacher attendance laga sakte hain — Class ' + className + ' ki 1st period ' + (dayNameOf(dateStr) || dateStr) + ' ko timetable mein nahi hai.';
+  if (p1.onLeave) return 'Class ' + className + ' ki 1st period wale teacher ' + (p1.teacher_name || '') + ' ' + (dayNameOf(dateStr) || dateStr) + ' ko chhuti par hain (' + (p1.leaveStatus || 'Leave') + ') — substitute assign karein ya admin attendance lagaye.';
+  if (p1.substitute) return 'Sirf 1st period wale teacher attendance laga sakte hain — Class ' + className + ' ki 1st period aaj substitute ' + (p1.teacher_name || 'kisi teacher') + ' ki hai (' + p1.subject + ', Period 1, ' + p1.start_time + '–' + p1.end_time + ').';
   return 'Sirf 1st period wale teacher attendance laga sakte hain — Class ' + className + ' ki 1st period ' + (p1.teacher_name || 'kisi teacher') + ' ki hai (' + p1.subject + ', Period 1, ' + p1.start_time + '–' + p1.end_time + ').';
 }
 function requireRole(...roles) {
@@ -626,6 +752,7 @@ function seed() {
 }
 ensureTeacherColumns();
 ensureStudentBFormColumn();
+ensureSettings();
 seed();
 ensureTeacherColumns();
 ensureResultsClassColumn();
@@ -633,6 +760,7 @@ ensureStudentBFormColumn();
 ensureRoleAccounts();
 cleanTeacherAssignments();
 fixTimetableConflicts();
+syncTimetableShape();
 
 // ---------- app ----------
 const app = express();
@@ -1098,7 +1226,7 @@ app.get('/api/promotions', requireAdmin, (req, res) => {
 
 // timetable
 app.get('/api/timetable', requireAuth, (req, res) => {
-  const { class: cls } = req.query;
+  const { class: cls, date } = req.query;
   const role = req.session.role || 'admin';
   let sql = 'SELECT tt.*, t.name teacher_name FROM timetable tt LEFT JOIN teachers t ON t.id=tt.teacher_id WHERE 1=1'; const p = [];
   if (role === 'teacher') { sql += ' AND tt.teacher_id=?'; p.push(req.session.teacherId); }
@@ -1108,12 +1236,41 @@ app.get('/api/timetable', requireAuth, (req, res) => {
     sql += ' AND tt.class_name=?'; p.push(child.class_name);
   }
   if (cls) { sql += ' AND tt.class_name=?'; p.push(cls); }
-  res.json(db.prepare(sql + ' ORDER BY tt.day, tt.period').all(...p));
+  let rows = db.prepare(sql + ' ORDER BY tt.day, tt.period').all(...p);
+  // ?date=YYYY-MM-DD: apply the leave/substitute overlay for that date's
+  // weekday only — a teacher on Leave/Absent that day shows as Free (on
+  // leave) with original_teacher_name, a substitute override shows the
+  // substitute. Teachers see their own weekly timetable as assigned (no
+  // overlay), so their own periods never disappear from My Timetable.
+  if (date && role !== 'teacher') {
+    const day = dayNameOf(date);
+    rows = rows.map(r => (r.day === day ? effectiveRow(r, date) : r));
+  }
+  res.json(rows);
+});
+// Timetable settings (admin only): periods per day (4-8) + slot times.
+// GET returns the current settings; POST stores them server-side and
+// reshapes the timetable (extra periods added as Free, removed periods
+// dropped, all rows retimed) — subjects/teachers of kept rows are kept.
+app.get('/api/timetable/settings', requireAdmin, (req, res) => res.json(getTimetableSettings()));
+app.post('/api/timetable/settings', requireAdmin, (req, res) => {
+  const b = req.body || {};
+  let times = null;
+  if (Array.isArray(b.periodTimes)) {
+    times = b.periodTimes.map(t => Array.isArray(t) ? [String(t[0] || ''), String(t[1] || '')] : [String(t.start || ''), String(t.end || '')]);
+    for (const [s, e] of times) if (!TIME_RE.test(s) || !TIME_RE.test(e) || s >= e) return res.status(400).json({ error: 'Period time galat hai — time HH:MM mein ho aur start, end se pehle ho (e.g. 08:00–08:45).' });
+  }
+  const ppd = Number(b.periodsPerDay);
+  if (!Number.isFinite(ppd) || ppd < 4 || ppd > 8) return res.status(400).json({ error: 'Periods per day 4 se 8 ke beech mein ho.' });
+  const r = setTimetableSettings(ppd, times);
+  res.json({ ok: true, ...r, settings: getTimetableSettings() });
 });
 app.post('/api/timetable/regenerate', requireAdmin, (req, res) => {
   // Rebuild timetable from current teacher assignments — conflict-free
   // (a teacher is booked at most once per Day+Period; see buildTimetableRows).
+  // Date-specific substitutes are cleared too — they belonged to the old grid.
   db.prepare('DELETE FROM timetable').run();
+  db.prepare('DELETE FROM timetable_overrides').run();
   const { rows, filled, free } = buildTimetableRows();
   insertTimetableRows(rows);
   res.json({ ok: true, periods: rows.length, filled, free, conflicts: countTimetableConflicts() });
@@ -1124,17 +1281,29 @@ app.post('/api/timetable/regenerate', requireAdmin, (req, res) => {
 // With ?subject=, a teacher is only "qualified" for that subject if it is
 // their own subject — the UI must NOT offer a teacher of another subject.
 app.get('/api/timetable/available', requireAdmin, (req, res) => {
-  const { day, period, class: cls, subject } = req.query;
-  if (!TT_DAYS.includes(day) || !period || Number(period) < 1 || Number(period) > 6) return res.status(400).json({ error: 'Day aur Period (1-6) sahi dein.' });
+  const { day, period, class: cls, subject, date } = req.query;
+  if (!TT_DAYS.includes(day) || !period || Number(period) < 1 || Number(period) > 8) return res.status(400).json({ error: 'Day aur Period (1-8) sahi dein.' });
   const teachers = db.prepare('SELECT id, name, subjects FROM teachers ORDER BY name').all();
   const booked = db.prepare('SELECT teacher_id, class_name FROM timetable WHERE day=? AND period=? AND teacher_id IS NOT NULL').all(day, Number(period));
   const bookedById = new Map(booked.map(b => [b.teacher_id, b.class_name]));
-  res.json(teachers.map(t => ({
-    id: t.id, name: t.name, subjects: t.subjects,
-    available: !bookedById.has(t.id) || (cls && bookedById.get(t.id) === cls),
-    bookedClass: bookedById.get(t.id) || null,
-    qualified: !subject || subject === 'Free' || primarySubjectOf(t) === subject,
-  })));
+  // ?date=: a teacher on Leave/Absent that day is NOT available (their
+  // slot shows Free for a substitute), and a substitute already assigned
+  // for that date counts as booked at that slot.
+  const leave = date ? leaveMapFor(date) : new Map();
+  if (date) {
+    for (const ov of db.prepare('SELECT teacher_id, class_name FROM timetable_overrides WHERE date=? AND period=? AND teacher_id IS NOT NULL').all(date, Number(period))) bookedById.set(ov.teacher_id, ov.class_name + ' (substitute)');
+    for (const [tid] of leave) if (!bookedById.has(tid)) bookedById.set(tid, null);
+  }
+  res.json(teachers.map(t => {
+    const onLeave = leave.has(t.id);
+    const bookedClass = bookedById.get(t.id) || null;
+    return {
+      id: t.id, name: t.name, subjects: t.subjects,
+      available: !onLeave && (!bookedById.has(t.id) || (cls && bookedById.get(t.id) === cls)),
+      bookedClass, onLeave, leaveStatus: leave.get(t.id) || null,
+      qualified: !subject || subject === 'Free' || primarySubjectOf(t) === subject,
+    };
+  }));
 });
 // Edit / create a single timetable period (admin only). A teacher who is
 // already booked in another class at the same Day+Period is REFUSED —
@@ -1146,8 +1315,18 @@ app.post('/api/timetable/period', requireAdmin, (req, res) => {
   const subject = String(b.subject || '');
   const teacherId = b.teacher_id === null || b.teacher_id === '' || b.teacher_id === undefined ? null : Number(b.teacher_id);
   if (!CLASSES.includes(cls)) return res.status(400).json({ error: 'Class sahi dein.' });
-  if (!TT_DAYS.includes(day) || !period || period < 1 || period > 6) return res.status(400).json({ error: 'Day aur Period (1-6) sahi dein.' });
+  if (!TT_DAYS.includes(day) || !period || period < 1 || period > getPeriodsPerDay()) return res.status(400).json({ error: 'Day aur Period (1-' + getPeriodsPerDay() + ') sahi dein — periods per day settings se badhayein.' });
   if (subject !== 'Free' && !subjectsForClass(cls).includes(subject)) return res.status(400).json({ error: 'Subject is class ke liye sahi nahi hai.' });
+  // Optional start/end time in the click-to-edit panel: a period's time
+  // is a SLOT property — changing it updates that period number across
+  // the whole week (all classes, all days), not just this one cell.
+  const startTime = b.start_time ? String(b.start_time) : null;
+  const endTime = b.end_time ? String(b.end_time) : null;
+  if ((startTime && !TIME_RE.test(startTime)) || (endTime && !TIME_RE.test(endTime)) || (startTime && endTime && startTime >= endTime)) return res.status(400).json({ error: 'Time galat hai — HH:MM mein ho aur start, end se pehle ho (e.g. 08:00–08:45).' });
+  if (startTime && endTime) {
+    const cur = periodTimeFor(period);
+    if (cur[0] !== startTime || cur[1] !== endTime) updateSlotTime(period, startTime, endTime);
+  }
   if (subject === 'Free' && teacherId) return res.status(400).json({ error: 'Free period mein teacher nahi ho sakta.' });
   if (teacherId) {
     const teacher = db.prepare('SELECT id, name, subjects FROM teachers WHERE id=?').get(teacherId);
@@ -1163,11 +1342,51 @@ app.post('/api/timetable/period', requireAdmin, (req, res) => {
     const assigned = db.prepare('SELECT 1 FROM teacher_assignments WHERE teacher_id=? AND subject=?').get(teacherId, subject);
     if (!assigned) return res.status(400).json({ error: teacher.name + ' ko ' + subject + ' ki assignment nahi hai — pehle teacher ki assignments mein ' + subject + ' add karein.' });
   }
-  const times = TT_TIMES[period - 1];
+  const times = periodTimeFor(period);
   db.prepare(`INSERT INTO timetable (class_name,day,period,subject,teacher_id,start_time,end_time) VALUES (?,?,?,?,?,?,?)
     ON CONFLICT(class_name,day,period) DO UPDATE SET subject=excluded.subject, teacher_id=excluded.teacher_id, start_time=excluded.start_time, end_time=excluded.end_time`)
     .run(cls, day, period, subject, teacherId, times[0], times[1]);
   res.json({ ok: true });
+});
+// Substitute for ONE date only (admin only): when the timetabled teacher
+// is on Leave/Absent that day (or the slot is Free), assign a substitute
+// teacher for that date. The weekly timetable is NOT changed. A substitute
+// holding Period 1 that day can mark that class's attendance that day.
+// teacher_id null (or no body) clears the substitute for that slot/date.
+app.post('/api/timetable/substitute', requireAdmin, (req, res) => {
+  const b = req.body || {};
+  const cls = String(b.class_name || ''), day = String(b.day || ''), date = String(b.date || '');
+  const period = Number(b.period);
+  const teacherId = b.teacher_id === null || b.teacher_id === '' || b.teacher_id === undefined ? null : Number(b.teacher_id);
+  if (!CLASSES.includes(cls)) return res.status(400).json({ error: 'Class sahi dein.' });
+  if (!TT_DAYS.includes(day) || !period || period < 1 || period > getPeriodsPerDay()) return res.status(400).json({ error: 'Day aur Period (1-' + getPeriodsPerDay() + ') sahi dein.' });
+  if (!date || dayNameOf(date) !== day) return res.status(400).json({ error: 'Date usi din ki ho jo Day chuna hai (' + day + ') — e.g. Monday ke liye Monday wali date.' });
+  const row = db.prepare('SELECT * FROM timetable WHERE class_name=? AND day=? AND period=?').get(cls, day, period);
+  if (!row) return res.status(404).json({ error: 'Ye period timetable mein nahi hai.' });
+  if (!teacherId) {
+    db.prepare('DELETE FROM timetable_overrides WHERE class_name=? AND date=? AND period=?').run(cls, date, period);
+    return res.json({ ok: true, cleared: true });
+  }
+  const leave = leaveMapFor(date);
+  const originalOnLeave = row.teacher_id && leave.has(row.teacher_id);
+  if (!originalOnLeave && row.subject !== 'Free') { const orig = row.teacher_id ? db.prepare('SELECT name FROM teachers WHERE id=?').get(row.teacher_id) : null; return res.status(400).json({ error: 'Substitute sirf tab lagta hai jab original teacher us din chhuti par ho ya period Free ho — ' + (orig ? orig.name : 'teacher') + ' chhuti par nahi hain.' }); }
+  const subject = row.subject === 'Free' ? String(b.subject || '') : row.subject;
+  if (!subject || !subjectsForClass(cls).includes(subject)) return res.status(400).json({ error: 'Free period ke substitute ke liye subject chunein (is class ka subject).' });
+  const teacher = db.prepare('SELECT id, name, subjects FROM teachers WHERE id=?').get(teacherId);
+  if (!teacher) return res.status(400).json({ error: 'Teacher nahi mila.' });
+  if (primarySubjectOf(teacher) !== subject) return res.status(400).json({ error: teacher.name + ' sirf ' + (primarySubjectOf(teacher) || 'koi subject nahi') + ' parhate hain — ' + subject + ' ke substitute un ko nahi diya ja sakta.' });
+  if (leave.has(teacherId)) return res.status(400).json({ error: teacher.name + ' khud us din chhuti par hain (' + leave.get(teacherId) + ') — substitute nahi ban sakte.' });
+  const clash = db.prepare('SELECT class_name, subject FROM timetable WHERE day=? AND period=? AND teacher_id=? AND class_name<>?').get(day, period, teacherId, cls);
+  if (clash) return res.status(400).json({ error: teacher.name + ' us waqt pehle se Class ' + clash.class_name + ' mein ' + clash.subject + ' parha rahe hain (' + day + ', Period ' + period + ') — ek teacher ek hi waqt par do classes mein nahi ho sakta.' });
+  const clashOv = db.prepare('SELECT class_name FROM timetable_overrides WHERE date=? AND period=? AND teacher_id=? AND class_name<>?').get(date, period, teacherId, cls);
+  if (clashOv) return res.status(400).json({ error: teacher.name + ' us din us waqt pehle se Class ' + clashOv.class_name + ' ke substitute hain — ek teacher ek hi waqt par do classes mein nahi ho sakta.' });
+  const assigned = db.prepare('SELECT 1 FROM teacher_assignments WHERE teacher_id=? AND subject=?').get(teacherId, subject);
+  if (!assigned) return res.status(400).json({ error: teacher.name + ' ko ' + subject + ' ki assignment nahi hai — pehle teacher ki assignments mein ' + subject + ' add karein.' });
+  const times = periodTimeFor(period);
+  db.prepare(`INSERT INTO timetable_overrides (class_name,day,period,date,teacher_id,subject,start_time,end_time) VALUES (?,?,?,?,?,?,?,?)
+    ON CONFLICT(class_name,date,period) DO UPDATE SET teacher_id=excluded.teacher_id, subject=excluded.subject, start_time=excluded.start_time, end_time=excluded.end_time`)
+    .run(cls, day, period, date, teacherId, subject, times[0], times[1]);
+  res.json({ ok: true, substitute: teacher.name, subject, date });
 });
 
 // ---------- export & backup (admin only) ----------
