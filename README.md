@@ -46,6 +46,21 @@ all data is saved on the server in `data/school.db` via the Express API.
     Server APIs: `GET /api/fees?search=&class=`,
     `GET /api/results?search=&class=`, `GET /api/teachers?search=`,
     `GET /api/leaving?search=`, `GET /api/promotions?search=`.
+  - **Delete Student (admin only, with confirmation):** Profile aur
+    Students list dono mein Delete button hai. Confirm karne par student
+    ka record aur us se juda sab kuch delete hota hai — attendance, fees,
+    results, promotions, leaving record, notifications. Linked parent
+    login bhi delete hota hai — **sirf tab** jab us parent login se koi
+    aur bacha linked nahi hai (bhai/behen hone par parent login rehta
+    hai). API: `DELETE /api/students/:id` (transactional cascade).
+  - **Parent scoping (first-view leak fixed):** parent ko kabhi kisi aur
+    student ki list nahi dikhti — na pehli baar login par, na kabhi. Har
+    login par landing Dashboard hoti hai, purane session ki cached list
+    aur view blank kar diye jate hain, aur `/api/students` parent ke liye
+    sirf us ke linked children deta hai (server par koi unfiltered
+    fallback nahi — role na hone par 403). Linked children har request
+    par database se dobara nikale jate hain, session ke purane snapshot
+    se nahi.
 - **Attendance** — date-wise Present / Absent / Late / Leave, bulk mark,
   monthly % summary (API: `/api/attendance/summary`).
   - **Dashboard updates immediately after an edit:** the dashboard is

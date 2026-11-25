@@ -204,11 +204,13 @@ function parentChildIds(userId) {
   const u = db.prepare("SELECT student_id FROM users WHERE id=? AND role='parent'").get(userId);
   return u && u.student_id ? [u.student_id] : [];
 }
-// Child ids for the current session's parent (DB-backed, so it also
-// works for sessions started before a new child was linked).
+// Child ids for the current session's parent — ALWAYS recomputed from
+// the DB, never trusted from the session snapshot. A child unlinked or
+// deleted after login must disappear from the parent's view at once:
+// a stale session list (e.g. studentIds saved at login) is a leak —
+// the parent would keep seeing a child that is no longer theirs.
 function linkedChildIds(req) {
   if ((req.session.role || '') !== 'parent') return [];
-  if (req.session.studentIds && req.session.studentIds.length) return req.session.studentIds;
   return parentChildIds(req.session.userId);
 }
 // Backfill parent_students from the old single-link column (demo
@@ -1204,14 +1206,20 @@ app.get('/api/dashboard', requireAuth, (req, res) => {
 });
 
 // students
+// Role scoping is the whole point here: a parent gets ONLY their linked
+// children, a teacher only their own classes, admin the full list. There
+// is deliberately NO unfiltered fallback: a session whose role is missing
+// or unknown gets 403, never the admin list (the old `|| 'admin'`
+// default treated any role-less session as admin).
 app.get('/api/students', requireAuth, (req, res) => {
   const { class: cls, search, status, mode, roll } = req.query;
-  const role = req.session.role || 'admin';
+  const role = req.session.role;
   if (role === 'parent') {
     const ids = linkedChildIds(req);
     if (!ids.length) return res.status(403).json({ error: 'No child linked to this parent account' });
     return res.json(db.prepare('SELECT * FROM students WHERE id IN (' + ids.map(() => '?').join(',') + ')').all(...ids));
   }
+  if (role !== 'admin' && role !== 'teacher') return res.status(403).json({ error: 'Unknown role — please log in again' });
   let sql = 'SELECT * FROM students WHERE 1=1'; const p = [];
   if (cls) { sql += ' AND class_name=?'; p.push(cls); }
   if (status) { sql += ' AND status=?'; p.push(status); }
@@ -1274,15 +1282,63 @@ app.get('/api/students/:id/parent-login', requireAdmin, (req, res) => {
   res.json({ hasLogin: true, username: pl.username, passwordKnown: pl.passwordKnown, password: pl.password });
 });
 app.delete('/api/students/:id', requireAdmin, (req, res) => {
-  db.prepare('DELETE FROM students WHERE id=?').run(req.params.id);
-  res.json({ ok: true });
+  // Full cascade delete (admin only): the student row AND every row that
+  // belongs to them — attendance, fees, results, leaving record,
+  // promotions, notifications, parent links. The old version deleted
+  // only the students row and left all of that orphaned behind.
+  // The linked parent login is deleted too — but ONLY if that parent
+  // login has no other linked children left (siblings keep their login).
+  const id = Number(req.params.id);
+  const s = db.prepare('SELECT id, name, class_name, roll_no FROM students WHERE id=?').get(id);
+  if (!s) return res.status(404).json({ error: 'Student not found' });
+  const parentIds = [...new Set([
+    ...db.prepare('SELECT DISTINCT parent_user_id FROM parent_students WHERE student_id=?').all(id).map(r => r.parent_user_id),
+    ...db.prepare("SELECT id FROM users WHERE role='parent' AND student_id=?").all(id).map(r => r.id),
+  ])];
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.prepare('DELETE FROM attendance WHERE student_id=?').run(id);
+    db.prepare('DELETE FROM fees WHERE student_id=?').run(id);
+    db.prepare('DELETE FROM results WHERE student_id=?').run(id);
+    db.prepare('DELETE FROM leaving_records WHERE student_id=?').run(id);
+    db.prepare('DELETE FROM promotions WHERE student_id=?').run(id);
+    db.prepare('DELETE FROM notifications WHERE student_id=?').run(id);
+    db.prepare('DELETE FROM parent_students WHERE student_id=?').run(id);
+    db.prepare('DELETE FROM students WHERE id=?').run(id);
+    const deletedParents = [];
+    for (const pid of parentIds) {
+      // Remaining children = links in parent_students UNION the legacy
+      // users.student_id column (only if that student still exists).
+      const remaining = db.prepare(`SELECT COUNT(*) c FROM (
+        SELECT student_id FROM parent_students WHERE parent_user_id=?
+        UNION
+        SELECT student_id FROM users WHERE id=? AND role='parent' AND student_id IS NOT NULL
+          AND student_id IN (SELECT id FROM students)
+      )`).get(pid, pid).c;
+      if (remaining === 0) {
+        db.prepare("DELETE FROM users WHERE id=? AND role='parent'").run(pid);
+        deletedParents.push(pid);
+      } else {
+        // Parent keeps the login: point users.student_id at a remaining
+        // child (or NULL) so it never dangles at the deleted student.
+        const next = db.prepare('SELECT student_id FROM parent_students WHERE parent_user_id=? ORDER BY student_id LIMIT 1').get(pid);
+        db.prepare('UPDATE users SET student_id=? WHERE id=? AND student_id=?').run(next ? next.student_id : null, pid, id);
+      }
+    }
+    db.exec('COMMIT');
+    res.json({ ok: true, deleted: s, parentLoginsDeleted: deletedParents.length });
+  } catch (e) {
+    db.exec('ROLLBACK');
+    res.status(500).json({ error: 'Delete failed: ' + e.message });
+  }
 });
 app.get('/api/students/:id', requireAuth, (req, res) => {
   const s = db.prepare('SELECT * FROM students WHERE id=?').get(req.params.id);
   if (!s) return res.status(404).json({ error: 'Not found' });
-  const role = req.session.role || 'admin';
+  const role = req.session.role;
   if (role === 'parent' && !linkedChildIds(req).includes(Number(req.params.id))) return res.status(403).json({ error: 'You can only see your own child' });
   if (role === 'teacher' && !teacherClasses(req).includes(s.class_name)) return res.status(403).json({ error: 'This student is not in your classes' });
+  if (role !== 'admin' && role !== 'parent' && role !== 'teacher') return res.status(403).json({ error: 'Unknown role — please log in again' });
   res.json(studentProfile(s.id));
 });
 app.post('/api/students/:id/leave', requireAdmin, (req, res) => {
@@ -1703,7 +1759,10 @@ app.get('/api/timetable', requireAuth, (req, res) => {
   let sql = 'SELECT tt.*, t.name teacher_name FROM timetable tt LEFT JOIN teachers t ON t.id=tt.teacher_id WHERE 1=1'; const p = [];
   if (role === 'teacher') { sql += ' AND tt.teacher_id=?'; p.push(req.session.teacherId); }
   if (role === 'parent') {
-    const child = db.prepare('SELECT class_name FROM students WHERE id=?').get(req.session.studentId);
+    // First linked child (DB-recomputed, not the session snapshot — a
+    // child deleted/unlinked after login must not keep showing).
+    const childId = linkedChildIds(req)[0];
+    const child = childId ? db.prepare('SELECT class_name FROM students WHERE id=?').get(childId) : null;
     if (!child) return res.json([]);
     sql += ' AND tt.class_name=?'; p.push(child.class_name);
   }
