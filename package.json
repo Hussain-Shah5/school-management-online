@@ -1,0 +1,12 @@
+{
+  "name": "school-management-online",
+  "version": "1.0.0",
+  "description": "Online School Management System - login, students, attendance, fees, results, teachers, timetable. Real SQLite database (Node built-in node:sqlite, file-based) + Express.",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=22.5" },
+  "dependencies": {
+    "express": "^4.19.2",
+    "express-session": "^1.18.0"
+  }
+}

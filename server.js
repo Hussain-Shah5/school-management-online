@@ -1,0 +1,570 @@
+// School Management System — Online (Express + real SQLite file database)
+// Node >= 22.5 required for built-in node:sqlite (no native compile step).
+//   better-sqlite3 was tried first: it fails to compile in locked-down
+//   sandboxes (node-gyp cannot download node headers). node:sqlite IS
+//   real SQLite (same .db file format) and needs no build step, so the
+//   app runs identically on Railway (Dockerfile pins node:24) and locally.
+const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
+const express = require('express');
+const session = require('express-session');
+const { DatabaseSync } = require('node:sqlite');
+
+const PORT = process.env.PORT || 3000;
+const DB_PATH = process.env.DATABASE_PATH || path.join(__dirname, 'data', 'school.db');
+fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+const db = new DatabaseSync(DB_PATH);
+db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
+
+// ---------- schema ----------
+db.exec(`
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  salt TEXT NOT NULL,
+  school_name TEXT NOT NULL DEFAULT 'Demo School',
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS students (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL, father_name TEXT DEFAULT '', class_name TEXT NOT NULL,
+  section TEXT DEFAULT 'A', roll_no TEXT DEFAULT '', phone TEXT DEFAULT '',
+  monthly_fee INTEGER DEFAULT 0, admission_date TEXT DEFAULT '',
+  status TEXT DEFAULT 'active'
+);
+CREATE TABLE IF NOT EXISTS attendance (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  student_id INTEGER NOT NULL, date TEXT NOT NULL, status TEXT NOT NULL, class_name TEXT NOT NULL,
+  UNIQUE(student_id, date)
+);
+CREATE TABLE IF NOT EXISTS fees (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  student_id INTEGER NOT NULL, month TEXT NOT NULL, amount INTEGER NOT NULL,
+  paid INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'pending',
+  payment_method TEXT DEFAULT '', payment_date TEXT DEFAULT '',
+  UNIQUE(student_id, month)
+);
+CREATE TABLE IF NOT EXISTS results (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  student_id INTEGER NOT NULL, exam TEXT NOT NULL, subject TEXT NOT NULL,
+  marks INTEGER NOT NULL, total_marks INTEGER NOT NULL DEFAULT 100,
+  UNIQUE(student_id, exam, subject)
+);
+CREATE TABLE IF NOT EXISTS teachers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL, designation TEXT DEFAULT '', qualification TEXT DEFAULT '',
+  salary INTEGER DEFAULT 0, phone TEXT DEFAULT '', subjects TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS teacher_assignments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  teacher_id INTEGER NOT NULL, class_name TEXT NOT NULL, subject TEXT NOT NULL,
+  UNIQUE(teacher_id, class_name, subject)
+);
+CREATE TABLE IF NOT EXISTS staff_attendance (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  teacher_id INTEGER NOT NULL, date TEXT NOT NULL, status TEXT NOT NULL,
+  UNIQUE(teacher_id, date)
+);
+CREATE TABLE IF NOT EXISTS leaving_records (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  student_id INTEGER NOT NULL UNIQUE, leaving_date TEXT NOT NULL,
+  reason TEXT DEFAULT '', last_class TEXT NOT NULL, slc_number TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS promotions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  student_id INTEGER NOT NULL, from_class TEXT NOT NULL, to_class TEXT NOT NULL,
+  exam TEXT NOT NULL, percentage REAL NOT NULL, date TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS timetable (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  class_name TEXT NOT NULL, day TEXT NOT NULL, period INTEGER NOT NULL,
+  subject TEXT NOT NULL, teacher_id INTEGER, start_time TEXT NOT NULL, end_time TEXT NOT NULL,
+  UNIQUE(class_name, day, period)
+);
+`);
+
+// ---------- helpers ----------
+function hashPassword(pw, salt) {
+  return crypto.scryptSync(pw, salt, 64).toString('hex');
+}
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const CLASSES = ['Nursery', 'KG', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10'];
+const CLASS_COUNTS = { Nursery: 18, KG: 20, '1': 22, '2': 19, '3': 24, '4': 21, '5': 23, '6': 18, '7': 25, '8': 20, '9': 22, '10': 17 };
+const CLASS_FEES = { Nursery: 1500, KG: 1500, '1': 1500, '2': 1700, '3': 1800, '4': 2000, '5': 2100, '6': 2300, '7': 2400, '8': 2500, '9': 2500, '10': 2700 };
+// Sum check: 18*1500+20*1500+22*1500+19*1700+24*1800+21*2000+23*2100+18*2300+25*2400+20*2500+22*2500+17*2700 = 508100
+function subjectsForClass(cls) {
+  if (cls === 'Nursery' || cls === 'KG') return ['English', 'Urdu', 'Maths', 'Nazra Quran', 'Drawing', 'Rhymes'];
+  if (['1', '2', '3', '4', '5'].includes(cls)) return ['English', 'Urdu', 'Maths', 'Science', 'Islamiat', 'Social Studies'];
+  if (['6', '7', '8'].includes(cls)) return ['English', 'Urdu', 'Maths', 'Science', 'Islamiat', 'Computer'];
+  return ['English', 'Urdu', 'Maths', 'Physics', 'Chemistry', 'Biology'];
+}
+function grade(pct) {
+  if (pct >= 90) return 'A+'; if (pct >= 80) return 'A'; if (pct >= 70) return 'B';
+  if (pct >= 60) return 'C'; if (pct >= 50) return 'D'; return 'F';
+}
+
+// ---------- seed (runs once, only when DB is empty) ----------
+function seed() {
+  if (db.prepare('SELECT COUNT(*) c FROM students').get().c > 0) return;
+  console.log('Seeding demo data (249 students, 14 teachers, fees, results, timetable)...');
+  db.exec('BEGIN IMMEDIATE');
+  const rnd = mulberry32(20261125);
+  const pick = (arr) => arr[Math.floor(rnd() * arr.length)];
+  // admin user
+  const salt = crypto.randomBytes(16).toString('hex');
+  db.prepare('INSERT INTO users (username,password_hash,salt,school_name,created_at) VALUES (?,?,?,?,?)')
+    .run('admin', hashPassword('admin123', salt), salt, 'Demo School', '2026-04-01');
+  const firstM = ['Ahmed', 'Ali', 'Bilal', 'Hassan', 'Usman', 'Hamza', 'Omar', 'Zain', 'Danish', 'Saad', 'Fahad', 'Arslan', 'Taha', 'Rayyan', 'Ibrahim', 'Mustafa', 'Abdullah', 'Ayan'];
+  const firstF = ['Ayesha', 'Fatima', 'Zainab', 'Maryam', 'Hira', 'Sara', 'Mahnoor', 'Amna', 'Iqra', 'Laiba', 'Noor', 'Khadija', 'Hafsa', 'Amina', 'Sana', 'Rania'];
+  const last = ['Khan', 'Ali', 'Ahmed', 'Malik', 'Hussain', 'Shah', 'Raza', 'Butt', 'Chaudhry', 'Sheikh', 'Mirza', 'Qureshi', 'Siddiqui', 'Akhtar', 'Nawaz', 'Iqbal'];
+  const studentIds = [];
+  const addStudent = db.prepare('INSERT INTO students (name,father_name,class_name,section,roll_no,phone,monthly_fee,admission_date,status) VALUES (?,?,?,?,?,?,?,?,?)');
+  for (const cls of CLASSES) {
+    for (let i = 1; i <= CLASS_COUNTS[cls]; i++) {
+      const female = rnd() < 0.45;
+      const fn = female ? pick(firstF) : pick(firstM);
+      const ln = pick(last);
+      const name = `${fn} ${ln}`;
+      const father = `${pick(firstM)} ${ln}`;
+      const phone = `03${String(Math.floor(rnd() * 9) + 1)}${String(Math.floor(rnd() * 9000000) + 1000000)}`;
+      const r = addStudent.run(name, father, cls, rnd() < 0.8 ? 'A' : 'B', String(i).padStart(2, '0'), phone, CLASS_FEES[cls], `2026-04-${String(Math.floor(rnd() * 20) + 1).padStart(2, '0')}`, 'active');
+      studentIds.push({ id: Number(r.lastInsertRowid), cls, fee: CLASS_FEES[cls] });
+    }
+  }
+  // results: Mid Term 2026, 6 subjects each
+  const addResult = db.prepare('INSERT INTO results (student_id,exam,subject,marks,total_marks) VALUES (?,?,?,?,100)');
+  for (const s of studentIds) {
+    for (const subj of subjectsForClass(s.cls)) {
+      addResult.run(s.id, 'Mid Term 2026', subj, 45 + Math.floor(rnd() * 54));
+    }
+  }
+  // fees: Oct + Nov 2026. Nov must total 508100, collected 317150, pending 190950.
+  const addFee = db.prepare('INSERT INTO fees (student_id,month,amount,paid,status,payment_method,payment_date) VALUES (?,?,?,?,?,?,?)');
+  const feeStatus = (paid, amount) => paid === 0 ? 'pending' : paid >= amount ? 'paid' : 'partial';
+  // October: 70% paid, 15% partial (half), 15% pending
+  for (const s of studentIds) {
+    const r = rnd();
+    const paid = r < 0.7 ? s.fee : r < 0.85 ? Math.floor(s.fee / 2) : 0;
+    addFee.run(s.id, '2026-10', s.fee, paid, feeStatus(paid, s.fee), paid ? pick(['Cash', 'JazzCash', 'EasyPaisa', 'Bank']) : '', paid ? '2026-10-10' : '');
+  }
+  // November: start with same pattern, then adjust paid amounts (in Rs 100 steps,
+  // staying within [0, amount]) until collected == 317150 exactly.
+  const novPaid = new Map();
+  let collected = 0;
+  for (const s of studentIds) {
+    const r = rnd();
+    const paid = r < 0.62 ? s.fee : r < 0.78 ? Math.floor(s.fee / 2) : 0;
+    novPaid.set(s.id, paid); collected += paid;
+  }
+  const TARGET = 317150;
+  let guard = 0;
+  while (collected !== TARGET && guard++ < 10000) {
+    for (const s of studentIds) {
+      if (collected === TARGET) break;
+      const cur = novPaid.get(s.id);
+      if (collected < TARGET && cur < s.fee) { const d = Math.min(100, TARGET - collected, s.fee - cur); novPaid.set(s.id, cur + d); collected += d; }
+      else if (collected > TARGET && cur > 0) { const d = Math.min(100, collected - TARGET, cur); novPaid.set(s.id, cur - d); collected -= d; }
+    }
+  }
+  for (const s of studentIds) {
+    const paid = novPaid.get(s.id);
+    addFee.run(s.id, '2026-11', s.fee, paid, feeStatus(paid, s.fee), paid ? pick(['Cash', 'JazzCash', 'EasyPaisa', 'Bank']) : '', paid ? '2026-11-10' : '');
+  }
+  console.log('Nov fees check: total=508100 collected=' + collected + ' pending=' + (508100 - collected));
+  console.log('seed: teachers start');
+  // teachers (14)
+  const teachers = [
+    ['Ahmed Raza', 'Senior Teacher', 'M.Sc Maths', 65000, 'Maths'],
+    ['Fatima Zahra', 'Senior Teacher', 'M.A English', 62000, 'English'],
+    ['Muhammad Asif', 'Teacher', 'M.A Urdu', 55000, 'Urdu'],
+    ['Ayesha Khan', 'Science Teacher', 'M.Sc Physics', 60000, 'Science'],
+    ['Bilal Hussain', 'Teacher', 'M.Sc Chemistry', 60000, 'Chemistry'],
+    ['Sana Malik', 'Teacher', 'M.Sc Biology', 58000, 'Biology'],
+    ['Usman Ghani', 'Teacher', 'M.Sc Physics', 58000, 'Physics'],
+    ['Maryam Nawaz', 'Junior Teacher', 'B.Ed', 45000, 'Islamiat'],
+    ['Hassan Ali', 'Computer Teacher', 'BCS', 55000, 'Computer'],
+    ['Hira Shah', 'Junior Teacher', 'M.A Social Studies', 48000, 'Social Studies'],
+    ['Omar Farooq', 'Junior Teacher', 'B.A', 42000, 'Drawing'],
+    ['Zainab Bibi', 'Qaria', 'Hafiz-e-Quran', 40000, 'Nazra Quran'],
+    ['Danish Iqbal', 'Junior Teacher', 'B.Ed', 44000, 'Rhymes'],
+    ['Amna Tariq', 'Teacher', 'M.Sc Maths', 56000, 'Maths'],
+  ];
+  const addTeacher = db.prepare('INSERT INTO teachers (name,designation,qualification,salary,phone,subjects) VALUES (?,?,?,?,?,?)');
+  const teacherIds = [];
+  teachers.forEach(([name, des, qual, sal, subj], i) => {
+    const phone = `03${String(10 + i)}${String(2000000 + i * 111111)}`;
+    const r = addTeacher.run(name, des, qual, sal, phone, subj);
+    teacherIds.push({ id: Number(r.lastInsertRowid), subject: subj });
+  });
+  console.log('seed: assignments start');
+  // assignments: each teacher 5 class+subject combos = 70
+  const addAssign = db.prepare('INSERT OR IGNORE INTO teacher_assignments (teacher_id,class_name,subject) VALUES (?,?,?)');
+  const classForSubject = (subj) => CLASSES.filter(c => subjectsForClass(c).includes(subj));
+  teacherIds.forEach((t, ti) => {
+    // 5 UNIQUE (class, subject) assignments per teacher = 70 total.
+    // Prefer the teacher's own subject when that class teaches it.
+    let made = 0, idx = ti;
+    while (made < 5 && idx < ti + 60) {
+      const cls = CLASSES[idx % CLASSES.length];
+      const subs = subjectsForClass(cls);
+      const subj = subs.includes(t.subject) ? t.subject : subs[idx % subs.length];
+      const r = addAssign.run(t.id, cls, subj);
+      if (r.changes) made++;
+      idx++;
+    }
+  });
+  console.log('seed: staff attendance start');
+  // staff attendance 24-25 Nov 2026 (28 rows)
+  const addStaffAtt = db.prepare('INSERT INTO staff_attendance (teacher_id,date,status) VALUES (?,?,?)');
+  for (const t of teacherIds) {
+    addStaffAtt.run(t.id, '2026-11-24', rnd() < 0.95 ? 'Present' : 'Leave');
+    addStaffAtt.run(t.id, '2026-11-25', rnd() < 0.95 ? 'Present' : 'Leave');
+  }
+  console.log('seed: leaving start');
+  // leaving records: 8 students (mark status left)
+  const leaving = [
+    ['Family shifted to Lahore', '2026-10-15', 'SLC-2026-001'],
+    ['Family shifted to Karachi', '2026-10-20', 'SLC-2026-002'],
+    ['Admission in another school', '2026-11-05', 'SLC-2026-003'],
+    ['Family shifted abroad', '2026-09-28', 'SLC-2026-004'],
+    ['Financial problems', '2026-10-30', 'SLC-2026-005'],
+    ['Family shifted to Islamabad', '2026-11-12', 'SLC-2026-006'],
+    ['Admission in another school', '2026-10-08', 'SLC-2026-007'],
+    ['Family shifted to Multan', '2026-11-18', 'SLC-2026-008'],
+  ];
+  const leftIds = [];
+  for (let i = 0; i < 8; i++) {
+    const s = studentIds[20 + i * 28];
+    leftIds.push(s.id);
+    db.prepare("UPDATE students SET status='left' WHERE id=?").run(s.id);
+    db.prepare('INSERT INTO leaving_records (student_id,leaving_date,reason,last_class,slc_number) VALUES (?,?,?,?,?)')
+      .run(s.id, leaving[i][1], leaving[i][0], s.cls, leaving[i][2]);
+  }
+  console.log('seed: promotions start');
+  // promotions: 224 records for active students
+  const prevClass = { Nursery: 'Playgroup', KG: 'Nursery', '1': 'KG', '2': '1', '3': '2', '4': '3', '5': '4', '6': '5', '7': '6', '8': '7', '9': '8', '10': '9' };
+  const addPromo = db.prepare('INSERT INTO promotions (student_id,from_class,to_class,exam,percentage,date) VALUES (?,?,?,?,?,?)');
+  const active = studentIds.filter(s => !leftIds.includes(s.id));
+  active.slice(0, 224).forEach(s => {
+    addPromo.run(s.id, prevClass[s.cls], s.cls, 'Annual Exam 2025', Math.round((55 + rnd() * 38) * 10) / 10, '2026-03-31');
+  });
+  console.log('seed: attendance start');
+  // attendance 24-25 Nov 2026 for active students (241)
+  const addAtt = db.prepare('INSERT INTO attendance (student_id,date,status,class_name) VALUES (?,?,?,?)');
+  const mkDay = (date, nPresent, nAbsent, nLate) => {
+    const shuffled = [...active];
+    for (let i = shuffled.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]]; }
+    shuffled.forEach((s, idx) => {
+      const st = idx < nPresent ? 'Present' : idx < nPresent + nAbsent ? 'Absent' : idx < nPresent + nAbsent + nLate ? 'Late' : 'Leave';
+      addAtt.run(s.id, date, st, s.cls);
+    });
+  };
+  mkDay('2026-11-24', 228, 8, 4); // +1 Leave = 241
+  mkDay('2026-11-25', 230, 7, 3); // +1 Leave = 241
+  console.log('seed: timetable start');
+  // timetable: 12 classes x Mon-Sat x 6 periods = 432
+  const addTT = db.prepare('INSERT INTO timetable (class_name,day,period,subject,teacher_id,start_time,end_time) VALUES (?,?,?,?,?,?,?)');
+  const days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+  const times = [['08:00', '08:45'], ['08:45', '09:30'], ['09:30', '10:15'], ['10:45', '11:30'], ['11:30', '12:15'], ['12:15', '13:00']];
+  const teacherFor = (cls, subj) => {
+    const row = db.prepare('SELECT teacher_id FROM teacher_assignments WHERE class_name=? AND subject=? LIMIT 1').get(cls, subj);
+    if (row) return row.teacher_id;
+    const row2 = db.prepare('SELECT teacher_id FROM teacher_assignments WHERE subject=? LIMIT 1').get(subj);
+    return row2 ? row2.teacher_id : teacherIds[0].id;
+  };
+  for (const cls of CLASSES) {
+    const subs = subjectsForClass(cls);
+    days.forEach((day, di) => {
+      for (let p = 1; p <= 6; p++) {
+        const subj = subs[(di * 6 + p - 1) % subs.length];
+        addTT.run(cls, day, p, subj, teacherFor(cls, subj), times[p - 1][0], times[p - 1][1]);
+      }
+    });
+  }
+  db.exec('COMMIT');
+  console.log('Seed complete: students=' + studentIds.length + ', active=' + active.length + ', teachers=' + teacherIds.length);
+}
+seed();
+
+// ---------- app ----------
+const app = express();
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(session({
+  secret: process.env.SESSION_SECRET || 'school-management-dev-secret-change-me',
+  resave: false, saveUninitialized: false,
+  cookie: { httpOnly: true, sameSite: 'lax', maxAge: 1000 * 60 * 60 * 12 },
+}));
+app.use(express.static(path.join(__dirname, 'public')));
+
+const requireAuth = (req, res, next) => {
+  if (req.session && req.session.userId) return next();
+  res.status(401).json({ error: 'Login required' });
+};
+
+// auth
+app.post('/api/register', (req, res) => {
+  const { username, password, schoolName } = req.body || {};
+  if (!username || !password || password.length < 4) return res.status(400).json({ error: 'Username and password (min 4 chars) required' });
+  const salt = crypto.randomBytes(16).toString('hex');
+  try {
+    const r = db.prepare('INSERT INTO users (username,password_hash,salt,school_name,created_at) VALUES (?,?,?,?,?)')
+      .run(username, hashPassword(password, salt), salt, schoolName || 'My School', new Date().toISOString().slice(0, 10));
+    req.session.userId = Number(r.lastInsertRowid); req.session.username = username;
+    res.json({ ok: true, username, schoolName: schoolName || 'My School' });
+  } catch (e) { res.status(400).json({ error: 'Username already exists' }); }
+});
+app.post('/api/login', (req, res) => {
+  const { username, password } = req.body || {};
+  const u = db.prepare('SELECT * FROM users WHERE username=?').get(username);
+  if (!u || hashPassword(password || '', u.salt) !== u.password_hash) return res.status(401).json({ error: 'Wrong username or password' });
+  req.session.userId = u.id; req.session.username = u.username;
+  res.json({ ok: true, username: u.username, schoolName: u.school_name });
+});
+app.post('/api/logout', (req, res) => { req.session.destroy(() => res.json({ ok: true })); });
+app.get('/api/me', (req, res) => {
+  if (!req.session.userId) return res.json({ loggedIn: false });
+  const u = db.prepare('SELECT username, school_name FROM users WHERE id=?').get(req.session.userId);
+  res.json({ loggedIn: true, username: u.username, schoolName: u.school_name });
+});
+
+// dashboard
+app.get('/api/dashboard', requireAuth, (req, res) => {
+  const today = req.query.today || '2026-11-25';
+  const month = req.query.month || '2026-11';
+  const total = db.prepare("SELECT COUNT(*) c FROM students WHERE status='active'").get().c;
+  const totalAll = db.prepare('SELECT COUNT(*) c FROM students').get().c;
+  const att = db.prepare('SELECT status, COUNT(*) c FROM attendance WHERE date=? GROUP BY status').all(today);
+  const present = (att.find(a => a.status === 'Present') || { c: 0 }).c;
+  const fees = db.prepare('SELECT COALESCE(SUM(amount),0) total, COALESCE(SUM(paid),0) collected FROM fees WHERE month=?').get(month);
+  const pending = db.prepare("SELECT COUNT(*) c FROM fees WHERE month=? AND status!='paid'").get(month).c;
+  const teachers = db.prepare('SELECT COUNT(*) c FROM teachers').get().c;
+  const staffPresent = db.prepare("SELECT COUNT(*) c FROM staff_attendance WHERE date=? AND status='Present'").get(today).c;
+  const left = db.prepare('SELECT COUNT(*) c FROM leaving_records').get().c;
+  const promoted = db.prepare('SELECT COUNT(*) c FROM promotions').get().c;
+  const byClass = db.prepare("SELECT class_name, COUNT(*) c FROM students WHERE status='active' GROUP BY class_name").all();
+  res.json({ total, totalAll, today, month, present, attendance: att, feesTotal: fees.total, feesCollected: fees.collected, feesPending: fees.total - fees.collected, feesPendingCount: pending, teachers, staffPresent, left, promoted, byClass });
+});
+
+// students
+app.get('/api/students', requireAuth, (req, res) => {
+  const { class: cls, search, status } = req.query;
+  let sql = 'SELECT * FROM students WHERE 1=1'; const p = [];
+  if (cls) { sql += ' AND class_name=?'; p.push(cls); }
+  if (status) { sql += ' AND status=?'; p.push(status); }
+  if (search) { sql += ' AND (name LIKE ? OR father_name LIKE ? OR roll_no LIKE ?)'; p.push(`%${search}%`, `%${search}%`, `%${search}%`); }
+  sql += ' ORDER BY class_name, CAST(roll_no AS INTEGER)';
+  res.json(db.prepare(sql).all(...p));
+});
+app.get('/api/classes', requireAuth, (req, res) => res.json(CLASSES));
+app.post('/api/students', requireAuth, (req, res) => {
+  const b = req.body || {};
+  if (!b.name || !b.class_name) return res.status(400).json({ error: 'Name and class required' });
+  const r = db.prepare('INSERT INTO students (name,father_name,class_name,section,roll_no,phone,monthly_fee,admission_date,status) VALUES (?,?,?,?,?,?,?,?,?)')
+    .run(b.name, b.father_name || '', b.class_name, b.section || 'A', b.roll_no || '', b.phone || '', b.monthly_fee || 0, b.admission_date || '', 'active');
+  res.json({ ok: true, id: Number(r.lastInsertRowid) });
+});
+app.put('/api/students/:id', requireAuth, (req, res) => {
+  const b = req.body || {};
+  db.prepare('UPDATE students SET name=?,father_name=?,class_name=?,section=?,roll_no=?,phone=?,monthly_fee=?,admission_date=? WHERE id=?')
+    .run(b.name, b.father_name || '', b.class_name, b.section || 'A', b.roll_no || '', b.phone || '', b.monthly_fee || 0, b.admission_date || '', req.params.id);
+  res.json({ ok: true });
+});
+app.delete('/api/students/:id', requireAuth, (req, res) => {
+  db.prepare('DELETE FROM students WHERE id=?').run(req.params.id);
+  res.json({ ok: true });
+});
+app.get('/api/students/:id', requireAuth, (req, res) => {
+  const s = db.prepare('SELECT * FROM students WHERE id=?').get(req.params.id);
+  if (!s) return res.status(404).json({ error: 'Not found' });
+  const attendance = db.prepare('SELECT * FROM attendance WHERE student_id=? ORDER BY date DESC LIMIT 60').all(s.id);
+  const fees = db.prepare('SELECT * FROM fees WHERE student_id=? ORDER BY month').all(s.id);
+  const results = db.prepare('SELECT * FROM results WHERE student_id=? ORDER BY exam, subject').all(s.id);
+  const promotions = db.prepare('SELECT * FROM promotions WHERE student_id=? ORDER BY date DESC').all(s.id);
+  const leaving = db.prepare('SELECT * FROM leaving_records WHERE student_id=?').get(s.id);
+  res.json({ ...s, attendance, fees, results, promotions, leaving: leaving || null });
+});
+app.post('/api/students/:id/leave', requireAuth, (req, res) => {
+  const b = req.body || {};
+  db.prepare("UPDATE students SET status='left' WHERE id=?").run(req.params.id);
+  const s = db.prepare('SELECT class_name FROM students WHERE id=?').get(req.params.id);
+  db.prepare('INSERT OR REPLACE INTO leaving_records (student_id,leaving_date,reason,last_class,slc_number) VALUES (?,?,?,?,?)')
+    .run(req.params.id, b.leaving_date || new Date().toISOString().slice(0, 10), b.reason || '', s.class_name, b.slc_number || '');
+  res.json({ ok: true });
+});
+app.post('/api/students/:id/promote', requireAuth, (req, res) => {
+  const b = req.body || {};
+  const s = db.prepare('SELECT class_name FROM students WHERE id=?').get(req.params.id);
+  db.prepare('INSERT INTO promotions (student_id,from_class,to_class,exam,percentage,date) VALUES (?,?,?,?,?,?)')
+    .run(req.params.id, s.class_name, b.to_class, b.exam || 'Annual Exam', b.percentage || 0, b.date || new Date().toISOString().slice(0, 10));
+  db.prepare("UPDATE students SET class_name=? WHERE id=?").run(b.to_class, req.params.id);
+  res.json({ ok: true });
+});
+
+// attendance
+app.get('/api/attendance', requireAuth, (req, res) => {
+  const { date, class: cls } = req.query;
+  if (!date) return res.status(400).json({ error: 'date required (YYYY-MM-DD)' });
+  let sql = 'SELECT a.*, s.name FROM attendance a JOIN students s ON s.id=a.student_id WHERE a.date=?'; const p = [date];
+  if (cls) { sql += ' AND a.class_name=?'; p.push(cls); }
+  res.json(db.prepare(sql + ' ORDER BY a.class_name, s.name').all(...p));
+});
+app.post('/api/attendance', requireAuth, (req, res) => {
+  const { date, records } = req.body || {};
+  if (!date || !Array.isArray(records)) return res.status(400).json({ error: 'date and records required' });
+  const ins = db.prepare('INSERT INTO attendance (student_id,date,status,class_name) VALUES (?,?,?,?) ON CONFLICT(student_id,date) DO UPDATE SET status=excluded.status');
+  for (const r of records) {
+    const s = db.prepare('SELECT class_name FROM students WHERE id=?').get(r.student_id);
+    if (s) ins.run(r.student_id, date, r.status, s.class_name);
+  }
+  res.json({ ok: true, saved: records.length });
+});
+app.get('/api/attendance/summary', requireAuth, (req, res) => {
+  const { month, class: cls } = req.query;
+  if (!month) return res.status(400).json({ error: 'month required (YYYY-MM)' });
+  const rows = db.prepare("SELECT student_id, COUNT(*) total, SUM(CASE WHEN status='Present' THEN 1 ELSE 0 END) present FROM attendance WHERE substr(date,1,7)=? GROUP BY student_id").all(month);
+  res.json(rows.map(r => ({ student_id: r.student_id, total: r.total, present: r.present, pct: r.total ? Math.round(r.present / r.total * 1000) / 10 : 0 })));
+});
+
+// fees
+app.get('/api/fees', requireAuth, (req, res) => {
+  const month = req.query.month || '2026-11';
+  res.json(db.prepare('SELECT f.*, s.name, s.class_name, s.father_name FROM fees f JOIN students s ON s.id=f.student_id WHERE f.month=? ORDER BY s.class_name, s.name').all(month));
+});
+app.post('/api/fees/generate', requireAuth, (req, res) => {
+  const month = (req.body || {}).month || '2026-11';
+  const students = db.prepare('SELECT id, monthly_fee FROM students').all();
+  const ins = db.prepare('INSERT OR IGNORE INTO fees (student_id,month,amount,paid,status) VALUES (?,?,?,0,?)');
+  let n = 0; for (const s of students) { const r = ins.run(s.id, month, s.monthly_fee, 'pending'); if (r.changes) n++; }
+  res.json({ ok: true, created: n, month });
+});
+app.post('/api/fees/:id/pay', requireAuth, (req, res) => {
+  const { amount, method } = req.body || {};
+  const f = db.prepare('SELECT * FROM fees WHERE id=?').get(req.params.id);
+  if (!f) return res.status(404).json({ error: 'Not found' });
+  const paid = Math.min(f.amount, f.paid + (Number(amount) || 0));
+  const status = paid === 0 ? 'pending' : paid >= f.amount ? 'paid' : 'partial';
+  db.prepare('UPDATE fees SET paid=?, status=?, payment_method=?, payment_date=? WHERE id=?')
+    .run(paid, status, method || f.payment_method || 'Cash', new Date().toISOString().slice(0, 10), req.params.id);
+  res.json({ ok: true, paid, status });
+});
+
+// results
+app.get('/api/results', requireAuth, (req, res) => {
+  const { exam, class: cls } = req.query;
+  let sql = 'SELECT r.*, s.name, s.class_name FROM results r JOIN students s ON s.id=r.student_id WHERE 1=1'; const p = [];
+  if (exam) { sql += ' AND r.exam=?'; p.push(exam); }
+  if (cls) { sql += ' AND s.class_name=?'; p.push(cls); }
+  res.json(db.prepare(sql + ' ORDER BY s.class_name, s.name, r.subject').all(...p));
+});
+app.post('/api/results', requireAuth, (req, res) => {
+  const b = req.body || {};
+  if (!b.student_id || !b.exam || !b.subject) return res.status(400).json({ error: 'student, exam and subject required' });
+  db.prepare('INSERT INTO results (student_id,exam,subject,marks,total_marks) VALUES (?,?,?,?,?) ON CONFLICT(student_id,exam,subject) DO UPDATE SET marks=excluded.marks, total_marks=excluded.total_marks')
+    .run(b.student_id, b.exam, b.subject, b.marks || 0, b.total_marks || 100);
+  res.json({ ok: true });
+});
+
+// teachers & staff
+app.get('/api/teachers', requireAuth, (req, res) => {
+  const teachers = db.prepare('SELECT * FROM teachers ORDER BY name').all();
+  res.json(teachers.map(t => ({
+    ...t,
+    assignments: db.prepare('SELECT * FROM teacher_assignments WHERE teacher_id=?').all(t.id),
+  })));
+});
+app.post('/api/teachers', requireAuth, (req, res) => {
+  const b = req.body || {};
+  if (!b.name) return res.status(400).json({ error: 'Name required' });
+  const r = db.prepare('INSERT INTO teachers (name,designation,qualification,salary,phone,subjects) VALUES (?,?,?,?,?,?)')
+    .run(b.name, b.designation || '', b.qualification || '', b.salary || 0, b.phone || '', b.subjects || '');
+  res.json({ ok: true, id: Number(r.lastInsertRowid) });
+});
+app.get('/api/teachers/:id', requireAuth, (req, res) => {
+  const t = db.prepare('SELECT * FROM teachers WHERE id=?').get(req.params.id);
+  if (!t) return res.status(404).json({ error: 'Not found' });
+  const assignments = db.prepare('SELECT * FROM teacher_assignments WHERE teacher_id=?').all(t.id);
+  // per-subject progress: average % of students in that class+subject from Mid Term 2026 results
+  const progress = assignments.map(a => {
+    const row = db.prepare(`SELECT AVG(CAST(r.marks AS REAL)/r.total_marks*100) avg, COUNT(*) n
+      FROM results r JOIN students s ON s.id=r.student_id
+      WHERE r.exam='Mid Term 2026' AND r.subject=? AND s.class_name=? AND s.status='active'`).get(a.subject, a.class_name);
+    const top = db.prepare(`SELECT s.name, CAST(r.marks AS REAL)/r.total_marks*100 pct
+      FROM results r JOIN students s ON s.id=r.student_id
+      WHERE r.exam='Mid Term 2026' AND r.subject=? AND s.class_name=? AND s.status='active'
+      ORDER BY pct DESC LIMIT 3`).all(a.subject, a.class_name);
+    return { ...a, avg: row && row.avg ? Math.round(row.avg * 10) / 10 : 0, students: row ? row.n : 0, top };
+  });
+  const staffAtt = db.prepare('SELECT * FROM staff_attendance WHERE teacher_id=? ORDER BY date DESC LIMIT 30').all(t.id);
+  const attPct = staffAtt.length ? Math.round(staffAtt.filter(a => a.status === 'Present').length / staffAtt.length * 1000) / 10 : 0;
+  const timetable = db.prepare('SELECT * FROM timetable WHERE teacher_id=? ORDER BY day, period').all(t.id);
+  res.json({ ...t, assignments, progress, staffAtt, attPct, timetable });
+});
+app.post('/api/teachers/:id/assignments', requireAuth, (req, res) => {
+  const b = req.body || {};
+  db.prepare('INSERT OR IGNORE INTO teacher_assignments (teacher_id,class_name,subject) VALUES (?,?,?)').run(req.params.id, b.class_name, b.subject);
+  res.json({ ok: true });
+});
+app.get('/api/staff-attendance', requireAuth, (req, res) => {
+  const { date } = req.query;
+  if (!date) return res.status(400).json({ error: 'date required' });
+  res.json(db.prepare('SELECT sa.*, t.name FROM staff_attendance sa JOIN teachers t ON t.id=sa.teacher_id WHERE sa.date=? ORDER BY t.name').all(date));
+});
+app.post('/api/staff-attendance', requireAuth, (req, res) => {
+  const { date, records } = req.body || {};
+  if (!date || !Array.isArray(records)) return res.status(400).json({ error: 'date and records required' });
+  const ins = db.prepare('INSERT INTO staff_attendance (teacher_id,date,status) VALUES (?,?,?) ON CONFLICT(teacher_id,date) DO UPDATE SET status=excluded.status');
+  for (const r of records) ins.run(r.teacher_id, date, r.status);
+  res.json({ ok: true, saved: records.length });
+});
+
+// leaving / promotions
+app.get('/api/leaving', requireAuth, (req, res) => {
+  res.json(db.prepare('SELECT l.*, s.name, s.father_name, s.phone FROM leaving_records l JOIN students s ON s.id=l.student_id ORDER BY l.leaving_date DESC').all());
+});
+app.get('/api/promotions', requireAuth, (req, res) => {
+  res.json(db.prepare('SELECT p.*, s.name, s.class_name FROM promotions p JOIN students s ON s.id=p.student_id ORDER BY p.date DESC, s.name LIMIT 500').all());
+});
+
+// timetable
+app.get('/api/timetable', requireAuth, (req, res) => {
+  const { class: cls } = req.query;
+  let sql = 'SELECT tt.*, t.name teacher_name FROM timetable tt LEFT JOIN teachers t ON t.id=tt.teacher_id WHERE 1=1'; const p = [];
+  if (cls) { sql += ' AND tt.class_name=?'; p.push(cls); }
+  res.json(db.prepare(sql + ' ORDER BY tt.day, tt.period').all(...p));
+});
+app.post('/api/timetable/regenerate', requireAuth, (req, res) => {
+  // Rebuild timetable from current teacher assignments (same rotation as seed)
+  db.prepare('DELETE FROM timetable').run();
+  const days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+  const times = [['08:00', '08:45'], ['08:45', '09:30'], ['09:30', '10:15'], ['10:45', '11:30'], ['11:30', '12:15'], ['12:15', '13:00']];
+  const teacherFor = (cls, subj) => {
+    const row = db.prepare('SELECT teacher_id FROM teacher_assignments WHERE class_name=? AND subject=? LIMIT 1').get(cls, subj);
+    if (row) return row.teacher_id;
+    const row2 = db.prepare('SELECT teacher_id FROM teacher_assignments WHERE subject=? LIMIT 1').get(subj);
+    return row2 ? row2.teacher_id : null;
+  };
+  const addTT = db.prepare('INSERT INTO timetable (class_name,day,period,subject,teacher_id,start_time,end_time) VALUES (?,?,?,?,?,?,?)');
+  for (const cls of CLASSES) {
+    const subs = subjectsForClass(cls);
+    days.forEach((day, di) => {
+      for (let p = 1; p <= 6; p++) {
+        const subj = subs[(di * 6 + p - 1) % subs.length];
+        addTT.run(cls, day, p, subj, teacherFor(cls, subj), times[p - 1][0], times[p - 1][1]);
+      }
+    });
+  }
+  res.json({ ok: true, periods: 432 });
+});
+
+app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+app.listen(PORT, () => console.log(`School Management System running on http://localhost:${PORT} — DB: ${DB_PATH}`));
