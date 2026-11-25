@@ -4,14 +4,28 @@
 <body>
 <div id="loginView" class="login-wrap">
   <h2>🏫 School Management System</h2>
-  <p>School login — apna account banaein ya demo login use karein.</p>
-  <div class="demo-box"><b>Demo login:</b><br>Username: <code>admin</code><br>Password: <code>admin123</code></div>
-  <label>School name (register ke liye)</label><input id="schoolName" placeholder="Demo School">
+  <p>School login — apna role chunein, phir login karein.</p>
+  <label>I am logging in as</label>
+  <div id="rolePick" style="display:flex;gap:6px;margin-bottom:6px">
+    <button type="button" data-role="admin" class="role-btn active">Admin</button>
+    <button type="button" data-role="teacher" class="role-btn secondary">Teacher</button>
+    <button type="button" data-role="parent" class="role-btn secondary">Parent</button>
+  </div>
+  <div class="demo-box" id="demoBox"></div>
+  <div id="adminFields">
+    <label>School name (register ke liye)</label><input id="schoolName" placeholder="Demo School">
+  </div>
+  <div id="parentFields" class="hidden">
+    <label>Parent phone (bachay ke record wala number)</label><input id="parentPhone" placeholder="e.g. 0314941079">
+    <label>Student roll no</label><input id="parentRoll" placeholder="e.g. 01">
+    <label>Student class</label><select id="parentClass"><option>Nursery</option><option>KG</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option><option>9</option><option>10</option></select>
+    <p style="font-size:13px;color:#64748b">Parent account banane ke liye phone + roll no + class wohi honi chahiye jo school ke record mein hai. Demo parent: username <code>parent1</code>, password <code>parent123</code> — bacha Sara Qureshi, Nursery.</p>
+  </div>
   <label>Username</label><input id="username" value="admin" autocomplete="username">
   <label>Password</label><input id="password" type="password" value="admin123" autocomplete="current-password">
   <div style="display:flex;gap:8px;margin-top:14px"><button id="loginBtn" style="flex:1">Login</button><button id="registerBtn" class="secondary" style="flex:1">Create Account</button></div>
   <p id="loginMsg" style="color:#b91c1c"></p>
-  <p style="font-size:13px;color:#64748b">Data server-side SQLite database mein save hota hai — browser band karne par bhi data rehta hai.</p>
+  <p style="font-size:13px;color:#64748b">Data server-side SQLite database mein save hota hai — browser band karne par bhi data rehta hai. Teacher sirf apni classes dekh sakta hai, parent sirf apna bacha — fees aur salaries sirf admin dekh sakta hai.</p>
 </div>
 
 <div id="appView" class="hidden">
