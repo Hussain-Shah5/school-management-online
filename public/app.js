@@ -22,8 +22,8 @@ const downloadFile = async (url, filename) => {
 };
 let me = null, tab = 'dashboard', studentsCache = [], teachersCache = [], myClasses = [];
 let loginRole = 'admin';
-const TABS_ADMIN = [['dashboard','Dashboard'],['students','Students'],['attendance','Attendance'],['fees','Fees'],['results','Results'],['teachers','Teachers & Staff'],['timetable','Timetable'],['leaving','Leaving / Promoted'],['backup','Backup & Export']];
-const TABS_TEACHER = [['dashboard','Dashboard'],['attendance','My Attendance'],['teachers','My Profile'],['timetable','My Timetable']];
+const TABS_ADMIN = [['dashboard','Dashboard'],['students','Students'],['attendance','Attendance'],['staffAttendance','Staff Attendance'],['fees','Fees'],['results','Results'],['teachers','Teachers & Staff'],['timetable','Timetable'],['leaving','Leaving / Promoted'],['backup','Backup & Export']];
+const TABS_TEACHER = [['dashboard','Dashboard'],['attendance','My Attendance'],['staffAttendance','My Staff Attendance'],['teachers','My Profile'],['timetable','My Timetable']];
 const TABS_PARENT = [['dashboard','Dashboard'],['students','My Child'],['timetable','Child Timetable']];
 const tabsFor = () => me && me.role === 'teacher' ? TABS_TEACHER : me && me.role === 'parent' ? TABS_PARENT : TABS_ADMIN;
 const CLASSES = ['Nursery','KG','1','2','3','4','5','6','7','8','9','10'];
@@ -103,7 +103,20 @@ $('#registerBtn').onclick = async () => {
   } catch (e) { $('#loginMsg').textContent = e.message; }
 };
 $('#logoutBtn').onclick = async () => { await api('/api/logout', { method: 'POST' }); checkLogin(); };
-$('#refreshBtn').onclick = () => loadTab(tab);
+// Dashboard cards are live data, not a snapshot: refresh them whenever
+// attendance (student or staff) is saved, and whenever the Date/Month
+// changes. Previously the dashboard was only fetched once at login, so an
+// attendance edit never changed the figures until the user logged out
+// and back in — that was bug 1.
+async function refreshDashboard() {
+  const heroDate = $('#heroDate');
+  if (heroDate) heroDate.textContent = new Date($('#todayInput').value + 'T00:00:00').toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' });
+  await loadDashboard();
+  if (tab !== 'dashboard') loadTab(tab);
+}
+$('#refreshBtn').onclick = () => refreshDashboard();
+$('#todayInput').onchange = () => refreshDashboard();
+$('#monthInput').onchange = () => refreshDashboard();
 function renderTabs() {
   const tabs = tabsFor();
   $('#tabs').innerHTML = tabs.map(([k, l]) => `<button data-t="${k}" class="${k===tab?'active':''}">${l}</button>`).join('');
@@ -115,7 +128,7 @@ function renderTabs() {
     nav.querySelectorAll('button').forEach(b => b.onclick = () => { tab = b.dataset.t; renderTabs(); loadTab(tab); window.scrollTo({ top: 0, behavior: 'smooth' }); });
   }
 }
-function loadTab(t) { ({ dashboard: loadDashboard, students: loadStudents, attendance: loadAttendance, fees: loadFees, results: loadResults, teachers: loadTeachers, timetable: loadTimetable, leaving: loadLeaving, backup: loadBackup })[t](); }
+function loadTab(t) { ({ dashboard: loadDashboard, students: loadStudents, attendance: loadAttendance, staffAttendance: loadStaffAttendance, fees: loadFees, results: loadResults, teachers: loadTeachers, timetable: loadTimetable, leaving: loadLeaving, backup: loadBackup })[t](); }
 
 async function loadDashboard() {
   const d = await api(`/api/dashboard?today=${$('#todayInput').value}&month=${$('#monthInput').value}`);
@@ -242,13 +255,14 @@ window.viewStudent = async (id) => {
   // even before any detailed previous-class subject result is added.
   (s.promotions || []).forEach(p => prevRows.push({ exam: p.exam, cls: p.from_class, pct: Number(p.percentage).toFixed(1), marks: '', year: yearOf(p.exam, p.date), source: 'Promotion record' }));
   window._curStudent = s;
+  window._prevRows = prevRows;
   const isAdmin = me.role === 'admin';
   openModal(`<h3>${esc(s.name)} — Class ${esc(s.class_name)}-${esc(s.section)}</h3>
   <p>Roll ${esc(s.roll_no)} | Father: ${esc(s.father_name)} | Phone: ${esc(s.phone)}<br>B-Form No: ${esc(s.b_form_no || '— not recorded yet (Edit se add karein)')} | Monthly fee Rs ${s.monthly_fee} | Admission ${esc(s.admission_date)} | Status ${s.status}</p>
   <h4>Results — Current Class ${esc(s.class_name)} — ${pct}% (${gradeFor(+pct)})</h4><div class="bar"><i style="width:${pct}%"></i></div>
   <table><tr><th>Exam</th><th>Subject</th><th>Marks</th></tr>${curResults.map(r=>`<tr><td>${esc(r.exam)}</td><td>${esc(r.subject)}</td><td>${r.marks}/${r.total_marks}</td></tr>`).join('') || '<tr><td colspan="3">No results yet for the current class.</td></tr>'}</table>
   <h4>Previous Class Results</h4>
-  ${prevRows.length ? `<table><tr><th>Exam</th><th>Class</th><th>Total</th><th>%</th><th>Grade</th><th>Year</th></tr>${prevRows.map(r=>`<tr><td>${esc(r.exam)}</td><td>${esc(r.cls)}</td><td>${esc(r.marks)}</td><td>${r.pct}%</td><td>${gradeFor(+r.pct)}</td><td>${esc(r.year)}</td></tr>`).join('')}</table><p style="font-size:13px;color:var(--muted)">Promotion-record rows come from the promotion history; subject-result rows were added with a previous class chosen in Add Result.</p>` : '<p>No previous class results yet. Admin/teacher can add one from Results → + Add Result, class chunein (purani class), aur exam/marks likhein.</p>'}
+  ${prevRows.length ? `<table><tr><th>Exam</th><th>Class</th><th>Total</th><th>%</th><th>Grade</th><th>Year</th><th></th></tr>${prevRows.map((r, i)=>`<tr><td>${esc(r.exam)}</td><td>${esc(r.cls)}</td><td>${esc(r.marks)}</td><td>${r.pct}%</td><td>${gradeFor(+r.pct)}</td><td>${esc(r.year)}</td><td><button class="secondary" onclick="viewPrevReportCard(${i})">View Report Card</button></td></tr>`).join('')}</table><p style="font-size:13px;color:var(--muted)">“View Report Card” se us purani class/exam ka poora report card khulta hai — subjects, marks, total, percentage aur grade ke saath. Promotion-record rows come from the promotion history; subject-result rows were added with a previous class chosen in Add Result.</p>` : '<p>No previous class results yet. Admin/teacher can add one from Results → + Add Result, class chunein (purani class), aur exam/marks likhein.</p>'}
   <h4>Fees</h4>${s.fees.map(f=>`<p>${f.month}: Rs ${f.paid}/${f.amount} — ${f.status}</p>`).join('')}
   <h4>Promotions</h4>${s.promotions.map(p=>`<p>${esc(p.from_class)} → ${esc(p.to_class)} (${esc(p.exam)}, ${p.percentage}%)</p>`).join('') || '<p>None</p>'}
   ${s.leaving ? `<h4>Leaving record</h4><p>${esc(s.leaving.leaving_date)} — ${esc(s.leaving.reason)} — SLC ${esc(s.leaving.slc_number)}</p>` : ''}
@@ -258,6 +272,39 @@ window.viewStudent = async (id) => {
   <button class="secondary" onclick="promoteStudent(${s.id})">Promote</button>` : ''}
   <button class="secondary" onclick="closeModal()">Close</button>
   <button onclick="window.print()">Print Result Card</button></div>`);
+};
+// ---- Previous-class report card ----
+// Every row in "Previous Class Results" has a View Report Card button.
+// It opens the full report card for that previous class + exam — subjects,
+// marks, total, percentage and grade — just like the current report card.
+// Subject rows come from the saved subject results; promotion-only rows
+// (no subject breakdown saved) show the exam / class / percentage / grade
+// from the promotion record with a note saying so.
+window.viewPrevReportCard = (i) => {
+  const row = (window._prevRows || [])[i];
+  const s = window._curStudent;
+  if (!row || !s) return;
+  const subjects = (s.results || []).filter(r => r.exam === row.exam && r.class_name === row.cls);
+  const totalMarks = subjects.reduce((a, r) => a + r.marks, 0), totalOf = subjects.reduce((a, r) => a + r.total_marks, 0);
+  const pct = totalOf ? (totalMarks / totalOf * 100).toFixed(1) : row.pct;
+  const grade = gradeFor(+pct);
+  openModal(`<div class="no-print" style="display:flex;justify-content:space-between;align-items:center"><h3 style="margin:0">Report Card — Previous Class</h3><button class="secondary" onclick="viewStudent(window._curStudent.id)">← Back to Profile</button></div>
+  <div style="text-align:center;border-bottom:2px solid #14532d;padding-bottom:8px;margin-bottom:12px">
+    <h2 style="margin:4px 0;color:#14532d">${esc(me.schoolName || 'Demo School')}</h2>
+    <p style="margin:0">Student Report Card — ${esc(row.exam)} (${esc(row.year || '')})</p>
+  </div>
+  <p><b>Student:</b> ${esc(s.name)} &nbsp;|&nbsp; <b>Father:</b> ${esc(s.father_name)}<br>
+  <b>Class (at that time):</b> ${esc(row.cls)} &nbsp;|&nbsp; <b>Roll No:</b> ${esc(s.roll_no)} &nbsp;|&nbsp; <b>B-Form:</b> ${esc(s.b_form_no || '—')}</p>
+  ${subjects.length
+    ? `<table><tr><th>Subject</th><th>Marks Obtained</th><th>Total Marks</th><th>%</th></tr>${subjects.map(r => `<tr><td>${esc(r.subject)}</td><td>${r.marks}</td><td>${r.total_marks}</td><td>${(r.marks / r.total_marks * 100).toFixed(1)}%</td></tr>`).join('')}</table>`
+    : `<p style="font-size:13px;color:var(--muted)">Is exam ke subject-wise marks is record mein nahi hain — neeche wala result promotion record se liya gaya hai.</p>`}
+  <h3>Total: ${subjects.length ? totalMarks + ' / ' + totalOf : '—'} &nbsp;•&nbsp; Percentage: ${pct}% &nbsp;•&nbsp; Grade: ${grade}</h3>
+  <p style="font-size:13px;color:var(--muted)">Exam: ${esc(row.exam)} • Class: ${esc(row.cls)} • Year: ${esc(row.year || '')} • Source: ${esc(row.source || '')}</p>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px" class="no-print">
+    <button onclick="window.print()">Print Report Card</button>
+    <button class="secondary" onclick="viewStudent(window._curStudent.id)">← Back to Profile</button>
+    <button class="secondary" onclick="closeModal()">Close</button>
+  </div>`);
 };
 window.leaveStudent = async (id) => {
   const reason = prompt('Leaving reason?', 'Family shifted'); if (reason === null) return;
@@ -276,17 +323,44 @@ async function loadAttendance() {
   const date = $('#todayInput').value;
   const isTeacher = me.role === 'teacher';
   if (isTeacher && !myClasses.length) { try { const t = await api('/api/my-teacher'); myClasses = t.assignments.map(a => a.class_name); myClasses = [...new Set(myClasses)]; } catch { myClasses = []; } }
-  const cls = isTeacher ? (stuFilter.class && myClasses.includes(stuFilter.class) ? stuFilter.class : (myClasses[0] || '')) : (stuFilter.class || '');
+  let cls = isTeacher ? (stuFilter.class && myClasses.includes(stuFilter.class) ? stuFilter.class : (myClasses[0] || '')) : (stuFilter.class || '');
+  // 1st-period rule — checked BEFORE anything to mark attendance is
+  // rendered. Only the teacher who holds Period 1 for a class on this day
+  // gets the marking option at all: no Save button, no status dropdowns,
+  // no "Mark all Present" — just a notice naming the Period 1 teacher and
+  // a read-only view of the saved attendance. Admin always gets the option.
+  // (The server enforces the same rule with 403, so it cannot be bypassed.)
+  const fetchPerm = async (c) => { try { return await api(`/api/attendance/permission?date=${date}&class=${encodeURIComponent(c)}`); } catch { return null; } };
+  let perm = cls ? await fetchPerm(cls) : null;
+  if (isTeacher && (!perm || !perm.allowed)) {
+    // Default to a class where this teacher DOES hold Period 1 today, so
+    // the marking option is visible by default when they have one.
+    for (const c of myClasses) {
+      if (c === cls) continue;
+      const p = await fetchPerm(c);
+      if (p && p.allowed) { cls = c; stuFilter.class = c; perm = p; break; }
+    }
+  }
+  const canMark = !isTeacher || (perm && perm.allowed);
   const list = await api('/api/students?class=' + cls + '&status=active');
+  // Prefill with the attendance already saved for this date/class, so an
+  // edit shows the real saved values instead of resetting to Present.
+  let savedAtt = {};
+  try { const rows = await api('/api/attendance?date=' + date + '&class=' + encodeURIComponent(cls)); rows.forEach(r => savedAtt[r.student_id] = r.status); } catch { savedAtt = {}; }
   const classOptions = isTeacher ? myClasses : CLASSES;
+  const statusOpts = (cur) => ['Present', 'Absent', 'Late', 'Leave'].map(s => `<option ${s === cur ? 'selected' : ''}>${s}</option>`).join('');
+  const statusCell = (s) => canMark
+    ? `<select data-sid="${s.id}" class="aStatus">${statusOpts(savedAtt[s.id] || 'Present')}</select>`
+    : `<b>${esc(savedAtt[s.id] || 'Not marked yet')}</b>`;
   $('#view').innerHTML = `<div class="card"><h3>Attendance — ${date}${isTeacher ? ' (my classes only)' : ''}</h3>
+  <div id="aPerm" style="margin:8px 0"></div>
   <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:8px">
   <div><label style="margin:0 0 4px">Class</label><select id="aClass" style="max-width:160px">${classOptions.map(c=>`<option ${c===cls?'selected':''}>${c}</option>`).join('')}</select></div>
   <div style="flex:1;min-width:200px"><label style="margin:0 0 4px">Search student (naam se)</label><input id="aSearch" placeholder="Naam likhein — e.g. Sara"></div>
-  <button id="aAll">Mark all Present</button> <button id="aSave">Save Attendance</button>
+  ${canMark ? '<button id="aAll">Mark all Present</button> <button id="aSave">Save Attendance</button>' : ''}
   ${isTeacher ? '' : '<button id="expAtt" class="secondary">Export Attendance CSV</button>'}</div>
-  <p id="aCount">${list.length} students in this class</p>
-  <table id="aTable"><tr><th>Name</th><th>Class</th><th>Status</th></tr>${list.map(s=>`<tr><td>${esc(s.name)}</td><td>${esc(s.class_name)}</td><td><select data-sid="${s.id}" class="aStatus"><option>Present</option><option>Absent</option><option>Late</option><option>Leave</option></select></td></tr>`).join('')}</table></div>`;
+  <p id="aCount">${list.length} students in this class${canMark ? '' : ' — read-only view (neeche sirf saved attendance dikh rahi hai, mark karne ka option nahi hai)'}</p>
+  <table id="aTable"><tr><th>Name</th><th>Class</th><th>Status</th></tr>${list.map(s=>`<tr><td>${esc(s.name)}</td><td>${esc(s.class_name)}</td><td>${statusCell(s)}</td></tr>`).join('')}</table></div>`;
   $('#aClass').onchange = e => { stuFilter.class = e.target.value; loadAttendance(); };
   // Name search filters the loaded rows in place (saved Present/Absent choices stay).
   $('#aSearch').oninput = () => {
@@ -295,13 +369,71 @@ async function loadAttendance() {
     document.querySelectorAll('#aTable tr:not(:first-child)').forEach(tr => { const hit = tr.cells[0].textContent.toLowerCase().includes(q); tr.style.display = hit ? '' : 'none'; if (hit) shown++; });
     $('#aCount').textContent = shown + ' of ' + list.length + ' students shown';
   };
-  $('#aAll').onclick = () => document.querySelectorAll('.aStatus').forEach(x => x.value = 'Present');
-  $('#aSave').onclick = async () => {
-    const records = [...document.querySelectorAll('.aStatus')].map(x => ({ student_id: +x.dataset.sid, status: x.value }));
-    await api('/api/attendance', { method: 'POST', body: JSON.stringify({ date, records }) });
-    alert('Attendance saved to server database (' + records.length + ' records).');
+  // These buttons only exist when the marking option is shown (canMark).
+  // A teacher without Period 1 for this class never sees them at all.
+  const allBtn = $('#aAll'); if (allBtn) allBtn.onclick = () => document.querySelectorAll('.aStatus').forEach(x => x.value = 'Present');
+  const saveBtn = $('#aSave');
+  if (saveBtn) saveBtn.onclick = async () => {
+    try {
+      const records = [...document.querySelectorAll('.aStatus')].map(x => ({ student_id: +x.dataset.sid, status: x.value }));
+      await api('/api/attendance', { method: 'POST', body: JSON.stringify({ date, records }) });
+      // Dashboard figures must change immediately after an edit — refetch
+      // them now (this was bug 1: the dashboard was only fetched at login).
+      await refreshDashboard();
+      alert('Attendance saved to server database (' + records.length + ' records). Dashboard abhi update ho gaya hai — Present / Absent ke naye figures upar dikh rahe hain.');
+    } catch (e) { alert(e.message); }
   };
   const expBtn = $('#expAtt'); if (expBtn) expBtn.onclick = () => downloadFile('/api/export/attendance?date=' + date, 'attendance-' + date + '.csv').catch(e => alert(e.message));
+  // Notice (from the permission already checked before rendering): the
+  // marking option itself is hidden for a teacher without Period 1 — no
+  // Save button, no dropdowns — only this notice + the read-only view.
+  const box = $('#aPerm');
+  if (box && cls) {
+    if (isTeacher) {
+      if (canMark && perm) box.innerHTML = `<div style="background:#dcfce7;border:1px solid #16a34a;border-radius:10px;padding:10px">✅ Aap ki 1st period hai — ${esc(perm.subject || '')}, Period 1 (${esc(perm.startTime || '')}–${esc(perm.endTime || '')}). Aap is class ki attendance laga sakte hain.</div>`;
+      else if (perm) box.innerHTML = `<div style="background:#fee2e2;border:1px solid #b91c1c;border-radius:10px;padding:10px">⛔ ${esc(perm.message || 'Sirf 1st period wale teacher attendance laga sakte hain.')} Is liye is class ki attendance lagane ka option aap ko nazar nahi aa raha.</div>`;
+      else box.innerHTML = `<div style="background:#fee2e2;border:1px solid #b91c1c;border-radius:10px;padding:10px">⛔ Permission check nahi ho saka — attendance lagane ka option chhupa diya gaya hai. Dobara try karein.</div>`;
+    } else if (perm) {
+      box.innerHTML = `<p style="font-size:13px;color:var(--muted)">Is class ki 1st period ${esc(perm.period1TeacherName || '—')} ki hai (${esc(perm.subject || '')}, Period 1). Admin kisi bhi class ki attendance laga sakta hai — teacher ko sirf apni 1st period wali class ki attendance lagane ka option dikhta hai.</p>`;
+    }
+  }
+}
+
+// ---- Staff Attendance (separate tab — NOT student attendance) ----
+let staffFilter = { search: '' };
+async function loadStaffAttendance() {
+  const date = $('#todayInput').value, month = $('#monthInput').value;
+  const isTeacher = me.role === 'teacher';
+  const teachers = await api('/api/teachers');
+  const saved = await api('/api/staff-attendance?date=' + date);
+  const savedById = {}; saved.forEach(r => savedById[r.teacher_id] = r.status);
+  const summary = await api('/api/staff-attendance/summary?month=' + month);
+  const sumById = {}; summary.forEach(s => sumById[s.teacher_id] = s);
+  const q = (staffFilter.search || '').toLowerCase();
+  const list = teachers.filter(t => !q || t.name.toLowerCase().includes(q));
+  $('#view').innerHTML = `<div class="card"><h3>${isTeacher ? 'My Staff Attendance' : 'Staff Attendance (Teachers) — ' + date}</h3>
+  <p style="font-size:13px;color:var(--muted)">${isTeacher ? 'Ye aap ki apni staff attendance hai — mark admin karta hai. Neeche aap ka is mahine ka record hai.' : 'Ye students ki attendance se alag hai. Har teacher ki hazri is date ke liye mark karein, phir Save dabayein. Dashboard par “Staff Present Today” ka figure isi se update hota hai.'}</p>
+  ${isTeacher ? '' : `<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:10px">
+  <div style="flex:1;min-width:220px"><label style="margin:0 0 4px">Search teacher (naam se)</label><input id="saSearch" placeholder="e.g. Ahmed, Fatima" value="${esc(staffFilter.search)}"></div>
+  <button id="saGo">Search</button><button id="saClear" class="secondary">Clear</button></div>`}
+  <table><tr><th>Teacher</th><th>Designation</th><th>Status (${date})</th><th>${month} — Present / Total (%)</th></tr>
+  ${list.map(t => { const s = sumById[t.id] || { present: 0, total: 0, pct: 0 };
+    return `<tr><td>${esc(t.name)}</td><td>${esc(t.designation)}</td>
+    <td>${isTeacher ? `<b>${esc(savedById[t.id] || 'Not marked yet')}</b>` : `<select data-tid="${t.id}" class="saStatus"><option ${savedById[t.id] === 'Present' ? 'selected' : ''}>Present</option><option ${savedById[t.id] === 'Absent' ? 'selected' : ''}>Absent</option><option ${savedById[t.id] === 'Late' ? 'selected' : ''}>Late</option><option ${savedById[t.id] === 'Leave' ? 'selected' : ''}>Leave</option></select>`}</td>
+    <td>${s.present} / ${s.total} (${s.pct}%)</td></tr>`; }).join('')}</table>
+  ${isTeacher ? '' : `<div style="display:flex;gap:8px;margin-top:12px"><button id="saSave">Save Staff Attendance</button></div>`}
+  <p style="font-size:13px;color:var(--muted)">Monthly summary: ${month} ke liye har teacher ki hazri % upar wale column mein hai.</p></div>`;
+  const saGo = $('#saGo'); if (saGo) saGo.onclick = () => { staffFilter.search = ($('#saSearch').value || '').trim(); loadStaffAttendance(); };
+  const saSearch = $('#saSearch'); if (saSearch) saSearch.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); staffFilter.search = (saSearch.value || '').trim(); loadStaffAttendance(); } };
+  const saClear = $('#saClear'); if (saClear) saClear.onclick = () => { staffFilter.search = ''; loadStaffAttendance(); };
+  const saSave = $('#saSave'); if (saSave) saSave.onclick = async () => {
+    try {
+      const records = [...document.querySelectorAll('.saStatus')].map(x => ({ teacher_id: +x.dataset.tid, status: x.value }));
+      await api('/api/staff-attendance', { method: 'POST', body: JSON.stringify({ date, records }) });
+      await refreshDashboard();
+      alert('Staff attendance saved (' + records.length + ' records). Dashboard par “Staff Present Today” update ho gaya hai.');
+    } catch (e) { alert(e.message); }
+  };
 }
 
 // ---- Fees (admin only) ----
