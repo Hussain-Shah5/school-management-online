@@ -125,6 +125,17 @@ CREATE TABLE IF NOT EXISTS notifications (
   created_at TEXT NOT NULL,
   UNIQUE(student_id, type, ref_key)
 );
+-- Parent logins, auto-created when a student is added (see
+-- ensureParentLoginForStudent): one parent account can be linked to
+-- several children (siblings share a parent phone), so the link lives
+-- here, not only in users.student_id (which still holds the FIRST child
+-- for backward compatibility). A parent only ever sees rows for their
+-- own linked children — enforced in the API.
+CREATE TABLE IF NOT EXISTS parent_students (
+  parent_user_id INTEGER NOT NULL,
+  student_id INTEGER NOT NULL,
+  PRIMARY KEY(parent_user_id, student_id)
+);
 `);
 
 // ---------- helpers ----------
@@ -179,8 +190,80 @@ const EXAM_OPTIONS = ['1st Term 2026', 'Mid Term 2026', 'Final Term 2026'];
 // created (the student may get a parent account later). Scoping is by
 // student_id: a parent login only ever receives rows for their own child.
 function parentUserIdForStudent(studentId) {
+  const link = db.prepare('SELECT parent_user_id FROM parent_students WHERE student_id=? ORDER BY parent_user_id LIMIT 1').get(studentId);
+  if (link) return link.parent_user_id;
   const u = db.prepare("SELECT id FROM users WHERE role='parent' AND student_id=?").get(studentId);
   return u ? u.id : null;
+}
+// All children linked to a parent account (siblings included), in
+// student-id order. Falls back to users.student_id for accounts created
+// before the parent_students table existed.
+function parentChildIds(userId) {
+  const rows = db.prepare('SELECT student_id FROM parent_students WHERE parent_user_id=? ORDER BY student_id').all(userId);
+  if (rows.length) return rows.map(r => r.student_id);
+  const u = db.prepare("SELECT student_id FROM users WHERE id=? AND role='parent'").get(userId);
+  return u && u.student_id ? [u.student_id] : [];
+}
+// Child ids for the current session's parent (DB-backed, so it also
+// works for sessions started before a new child was linked).
+function linkedChildIds(req) {
+  if ((req.session.role || '') !== 'parent') return [];
+  if (req.session.studentIds && req.session.studentIds.length) return req.session.studentIds;
+  return parentChildIds(req.session.userId);
+}
+// Backfill parent_students from the old single-link column (demo
+// parent1-5 and any self-registered parent). Runs on every startup;
+// INSERT OR IGNORE makes it a no-op once the links exist.
+function ensureParentStudents() {
+  try {
+    db.prepare("INSERT OR IGNORE INTO parent_students (parent_user_id, student_id) SELECT id, student_id FROM users WHERE role='parent' AND student_id IS NOT NULL").run();
+  } catch (e) { console.log('ensureParentStudents skipped: ' + e.message); }
+}
+// Parent login for one student, if one exists: username + whether the
+// password is the known auto one (parent123). Auto-created logins use
+// parent123; a self-registered parent chose their own password, which
+// the system never shows back.
+function parentLoginForStudent(studentId) {
+  const pid = parentUserIdForStudent(studentId);
+  if (!pid) return null;
+  const u = db.prepare('SELECT id, username FROM users WHERE id=?').get(pid);
+  if (!u) return null;
+  const passwordKnown = /^parent\d+$/.test(u.username) || /^parent-[a-z]/.test(u.username);
+  return { userId: u.id, username: u.username, passwordKnown, password: passwordKnown ? 'parent123' : null };
+}
+const slugPart = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '').slice(0, 20);
+// Auto parent login for a student (called when admin adds a student):
+//  1. student already has a parent login -> reuse it (no duplicate);
+//  2. same parent phone as another active student who has a parent login
+//     -> link this student to THAT parent account (siblings, one login);
+//  3. otherwise create a new parent login: username
+//     parent-<firstname>-<class>-<roll> (e.g. parent-ali-1-05), password
+//     parent123, linked to this student only.
+// Returns { created, reused, username, password, passwordKnown }.
+function ensureParentLoginForStudent(st) {
+  const existing = parentLoginForStudent(st.id);
+  if (existing) return { created: false, reused: true, ...existing };
+  const phone = String(st.phone || '').trim();
+  if (phone) {
+    const siblings = db.prepare("SELECT id FROM students WHERE phone=? AND id!=? AND status='active' ORDER BY id").all(phone, st.id);
+    for (const sib of siblings) {
+      const sibLogin = parentLoginForStudent(sib.id);
+      if (sibLogin) {
+        db.prepare('INSERT OR IGNORE INTO parent_students (parent_user_id, student_id) VALUES (?,?)').run(sibLogin.userId, st.id);
+        return { created: false, reused: true, newlyLinked: true, ...sibLogin };
+      }
+    }
+  }
+  const first = slugPart(String(st.name || '').split(' ')[0]) || 'student';
+  const cls = slugPart(st.class_name) || 'class';
+  const roll = slugPart(st.roll_no);
+  let base = 'parent-' + first + '-' + cls + '-' + (roll || st.id);
+  let username = base, suffix = 2;
+  while (db.prepare('SELECT id FROM users WHERE username=?').get(username)) username = base + '-' + suffix++;
+  const uid = createUser(username, 'parent123', 'Demo School', 'parent', null, st.id);
+  if (!uid) return { created: false, reused: false, username, password: null, passwordKnown: false };
+  db.prepare('INSERT OR IGNORE INTO parent_students (parent_user_id, student_id) VALUES (?,?)').run(uid, st.id);
+  return { created: true, reused: false, userId: uid, username, password: 'parent123', passwordKnown: true };
 }
 function createNotification(studentId, type, title, message, refKey, extra) {
   extra = extra || {};
@@ -683,6 +766,10 @@ function setSession(req, u) {
   req.session.role = u.role || 'admin';
   req.session.teacherId = u.teacher_id || null;
   req.session.studentId = u.student_id || null;
+  // Parent: all linked children (siblings share one login) — the first
+  // is the primary child shown on the parent dashboard.
+  req.session.studentIds = (u.role === 'parent') ? parentChildIds(u.id) : [];
+  if (req.session.studentIds.length && !req.session.studentId) req.session.studentId = req.session.studentIds[0];
 }
 function teacherClasses(req) {
   if (!req.session.teacherId) return [];
@@ -975,6 +1062,7 @@ ensureTeacherColumns();
 ensureResultsClassColumn();
 ensureStudentBFormColumn();
 ensureRoleAccounts();
+ensureParentStudents();
 seedNotifications();
 cleanTeacherAssignments();
 dedupeClassSubjectAssignments();
@@ -1007,6 +1095,10 @@ app.post('/api/register', (req, res) => {
     if (!phone || !rollNo || !className) return res.status(400).json({ error: 'Parent registration needs parent phone, student roll no and class' });
     const st = db.prepare("SELECT * FROM students WHERE phone=? AND roll_no=? AND class_name=? AND status='active'").get(String(phone).trim(), String(rollNo).trim(), className);
     if (!st) return res.status(400).json({ error: 'No active student found with that phone, roll no and class. Check the details with the school office.' });
+    // This child already has a parent login (auto-created when the
+    // student was added) — do not create a second one; point at it.
+    const already = parentLoginForStudent(st.id);
+    if (already) return res.status(400).json({ error: 'Is bachay ka parent login pehle se bana hua hai — Username: ' + already.username + (already.passwordKnown ? ' (password: parent123)' : ' — usi username se login karein.') });
     const uname = (username || String(phone).trim());
     const id = createUser(uname, password, schoolName || 'Demo School', 'parent', null, st.id);
     if (!id) return res.status(400).json({ error: 'Username already exists — try another username' });
@@ -1078,8 +1170,10 @@ app.get('/api/dashboard', requireAuth, (req, res) => {
     return res.json({ role, today, month, myClasses: my, mySubjects: [...new Set(myAssign.map(a => a.subject))], myStudents, present, late, attendance: att, progress: prof ? prof.progress : [], attPct, teacherName: prof ? prof.name : '' });
   }
   if (role === 'parent') {
-    const prof = studentProfile(req.session.studentId);
+    const childIds = linkedChildIds(req);
+    const prof = studentProfile(childIds[0]);
     if (!prof) return res.status(404).json({ error: 'Child not found' });
+    const children = childIds.map(id => { const p = studentProfile(id); return p ? { id: p.id, name: p.name, class_name: p.class_name, section: p.section, roll_no: p.roll_no } : null; }).filter(Boolean);
     const attTotal = prof.attendance.length;
     // Late counts as present: a late child still attended that day.
     const attPresent = prof.attendance.filter(a => isPresentStatus(a.status)).length;
@@ -1088,8 +1182,8 @@ app.get('/api/dashboard', requireAuth, (req, res) => {
     const feesPaid = prof.fees.reduce((a, f) => a + f.paid, 0);
     const totalMarks = prof.results.reduce((a, r) => a + r.marks, 0), totalOf = prof.results.reduce((a, r) => a + r.total_marks, 0);
     const pct = totalOf ? Math.round(totalMarks / totalOf * 1000) / 10 : 0;
-    const unreadCount = db.prepare('SELECT COUNT(*) c FROM notifications WHERE student_id=? AND is_read=0').get(req.session.studentId).c;
-    return res.json({ role, today, month, child: { id: prof.id, name: prof.name, class_name: prof.class_name, section: prof.section, roll_no: prof.roll_no, father_name: prof.father_name }, attPct: attTotal ? Math.round(attPresent / attTotal * 1000) / 10 : 0, attTotal, attPresent, attLate, feesTotal, feesPaid, feesPending: feesTotal - feesPaid, resultPct: pct, grade: grade(pct), unreadCount });
+    const unreadCount = childIds.length ? db.prepare('SELECT COUNT(*) c FROM notifications WHERE student_id IN (' + childIds.map(() => '?').join(',') + ') AND is_read=0').get(...childIds).c : 0;
+    return res.json({ role, today, month, child: { id: prof.id, name: prof.name, class_name: prof.class_name, section: prof.section, roll_no: prof.roll_no, father_name: prof.father_name }, children, attPct: attTotal ? Math.round(attPresent / attTotal * 1000) / 10 : 0, attTotal, attPresent, attLate, feesTotal, feesPaid, feesPending: feesTotal - feesPaid, resultPct: pct, grade: grade(pct), unreadCount });
   }
   const total = db.prepare("SELECT COUNT(*) c FROM students WHERE status='active'").get().c;
   const totalAll = db.prepare('SELECT COUNT(*) c FROM students').get().c;
@@ -1114,8 +1208,9 @@ app.get('/api/students', requireAuth, (req, res) => {
   const { class: cls, search, status, mode, roll } = req.query;
   const role = req.session.role || 'admin';
   if (role === 'parent') {
-    if (!req.session.studentId) return res.status(403).json({ error: 'No child linked to this parent account' });
-    return res.json(db.prepare('SELECT * FROM students WHERE id=?').all(req.session.studentId));
+    const ids = linkedChildIds(req);
+    if (!ids.length) return res.status(403).json({ error: 'No child linked to this parent account' });
+    return res.json(db.prepare('SELECT * FROM students WHERE id IN (' + ids.map(() => '?').join(',') + ')').all(...ids));
   }
   let sql = 'SELECT * FROM students WHERE 1=1'; const p = [];
   if (cls) { sql += ' AND class_name=?'; p.push(cls); }
@@ -1145,13 +1240,38 @@ app.post('/api/students', requireAdmin, (req, res) => {
   if (!b.name || !b.class_name) return res.status(400).json({ error: 'Name and class required' });
   const r = db.prepare('INSERT INTO students (name,father_name,class_name,section,roll_no,phone,monthly_fee,admission_date,b_form_no,status) VALUES (?,?,?,?,?,?,?,?,?,?)')
     .run(b.name, b.father_name || '', b.class_name, b.section || 'A', b.roll_no || '', b.phone || '', b.monthly_fee || 0, b.admission_date || '', (b.b_form_no || '').trim(), 'active');
-  res.json({ ok: true, id: Number(r.lastInsertRowid) });
+  const studentId = Number(r.lastInsertRowid);
+  // Auto parent login: the parent can log in immediately — no
+  // self-registration needed. Reuses the sibling's parent login when
+  // the phone matches (one login for the whole family).
+  const st = db.prepare('SELECT * FROM students WHERE id=?').get(studentId);
+  const parentLogin = ensureParentLoginForStudent(st);
+  res.json({ ok: true, id: studentId, parentLogin });
 });
 app.put('/api/students/:id', requireAdmin, (req, res) => {
   const b = req.body || {};
   db.prepare('UPDATE students SET name=?,father_name=?,class_name=?,section=?,roll_no=?,phone=?,monthly_fee=?,admission_date=?,b_form_no=? WHERE id=?')
     .run(b.name, b.father_name || '', b.class_name, b.section || 'A', b.roll_no || '', b.phone || '', b.monthly_fee || 0, b.admission_date || '', (b.b_form_no || '').trim(), req.params.id);
-  res.json({ ok: true });
+  // Editing a student who never got a parent login (added before this
+  // feature) also creates/links one — only reported when it is new.
+  const st = db.prepare('SELECT * FROM students WHERE id=?').get(req.params.id);
+  const out = { ok: true };
+  if (st) {
+    const pl = ensureParentLoginForStudent(st);
+    if (pl.created || pl.newlyLinked) out.parentLogin = pl;
+  }
+  res.json(out);
+});
+// Admin-only: this student's parent login (shown in the student profile
+// so the school office can give it to the parent). The password is only
+// shown when it is the known auto one (parent123); a self-registered
+// parent chose their own password, which is never shown back.
+app.get('/api/students/:id/parent-login', requireAdmin, (req, res) => {
+  const s = db.prepare('SELECT id FROM students WHERE id=?').get(req.params.id);
+  if (!s) return res.status(404).json({ error: 'Student not found' });
+  const pl = parentLoginForStudent(s.id);
+  if (!pl) return res.json({ hasLogin: false });
+  res.json({ hasLogin: true, username: pl.username, passwordKnown: pl.passwordKnown, password: pl.password });
 });
 app.delete('/api/students/:id', requireAdmin, (req, res) => {
   db.prepare('DELETE FROM students WHERE id=?').run(req.params.id);
@@ -1161,7 +1281,7 @@ app.get('/api/students/:id', requireAuth, (req, res) => {
   const s = db.prepare('SELECT * FROM students WHERE id=?').get(req.params.id);
   if (!s) return res.status(404).json({ error: 'Not found' });
   const role = req.session.role || 'admin';
-  if (role === 'parent' && Number(req.params.id) !== req.session.studentId) return res.status(403).json({ error: 'You can only see your own child' });
+  if (role === 'parent' && !linkedChildIds(req).includes(Number(req.params.id))) return res.status(403).json({ error: 'You can only see your own child' });
   if (role === 'teacher' && !teacherClasses(req).includes(s.class_name)) return res.status(403).json({ error: 'This student is not in your classes' });
   res.json(studentProfile(s.id));
 });
@@ -1188,7 +1308,7 @@ app.get('/api/attendance', requireAuth, (req, res) => {
   if (!date) return res.status(400).json({ error: 'date required (YYYY-MM-DD)' });
   const role = req.session.role || 'admin';
   let sql = 'SELECT a.*, s.name FROM attendance a JOIN students s ON s.id=a.student_id WHERE a.date=?'; const p = [date];
-  if (role === 'parent') { sql += ' AND a.student_id=?'; p.push(req.session.studentId); }
+  if (role === 'parent') { const ids = linkedChildIds(req); if (!ids.length) return res.json([]); sql += ' AND a.student_id IN (' + ids.map(() => '?').join(',') + ')'; p.push(...ids); }
   else if (role === 'teacher') {
     const my = teacherClasses(req);
     if (cls && !my.includes(cls)) return res.status(403).json({ error: 'This class is not yours' });
@@ -1264,7 +1384,7 @@ app.get('/api/attendance/summary', requireAuth, (req, res) => {
   if (!month) return res.status(400).json({ error: 'month required (YYYY-MM)' });
   let rows = db.prepare("SELECT student_id, COUNT(*) total, SUM(CASE WHEN status IN ('Present','Late') THEN 1 ELSE 0 END) present, SUM(CASE WHEN status='Late' THEN 1 ELSE 0 END) late FROM attendance WHERE substr(date,1,7)=? GROUP BY student_id").all(month);
   const role = req.session.role || 'admin';
-  if (role === 'parent') rows = rows.filter(r => r.student_id === req.session.studentId);
+  if (role === 'parent') { const ids = new Set(linkedChildIds(req)); rows = rows.filter(r => ids.has(r.student_id)); }
   if (role === 'teacher') {
     const my = teacherClasses(req);
     const ids = new Set(db.prepare("SELECT id FROM students WHERE class_name IN (" + my.map(() => '?').join(',') + ')').all(...my).map(x => x.id));
@@ -1315,7 +1435,7 @@ app.get('/api/results', requireAuth, (req, res) => {
   if (search) { sql += ' AND (s.name LIKE ? OR s.roll_no LIKE ? OR r.subject LIKE ?)'; p.push(`%${search}%`, `%${search}%`, `%${search}%`); }
   let rows = db.prepare(sql + ' ORDER BY s.class_name, s.name, r.subject').all(...p);
   const role = req.session.role || 'admin';
-  if (role === 'parent') rows = rows.filter(r => r.student_id === req.session.studentId);
+  if (role === 'parent') { const ids = new Set(linkedChildIds(req)); rows = rows.filter(r => ids.has(r.student_id)); }
   if (role === 'teacher') {
     const allowed = new Set(db.prepare('SELECT class_name, subject FROM teacher_assignments WHERE teacher_id=?').all(req.session.teacherId).map(a => a.class_name + '|' + a.subject));
     rows = rows.filter(r => allowed.has(r.class_name + '|' + r.subject));
@@ -1362,12 +1482,14 @@ app.get('/api/notifications', requireAuth, (req, res) => {
   if (role === 'teacher') return res.status(403).json({ error: 'Teachers have no parent notifications' });
   const { type } = req.query;
   if (role === 'parent') {
-    if (!req.session.studentId) return res.status(403).json({ error: 'No child linked to this parent account' });
-    let sql = 'SELECT n.*, s.name student_name, s.class_name FROM notifications n JOIN students s ON s.id=n.student_id WHERE n.student_id=?';
-    const p = [req.session.studentId];
+    const ids = linkedChildIds(req);
+    if (!ids.length) return res.status(403).json({ error: 'No child linked to this parent account' });
+    const inList = 'n.student_id IN (' + ids.map(() => '?').join(',') + ')';
+    let sql = 'SELECT n.*, s.name student_name, s.class_name FROM notifications n JOIN students s ON s.id=n.student_id WHERE ' + inList;
+    const p = [...ids];
     if (type) { sql += ' AND n.type=?'; p.push(type); }
     const rows = db.prepare(sql + ' ORDER BY n.created_at DESC, n.id DESC').all(...p);
-    const unread = db.prepare('SELECT COUNT(*) c FROM notifications WHERE student_id=? AND is_read=0').get(req.session.studentId).c;
+    const unread = db.prepare('SELECT COUNT(*) c FROM notifications WHERE student_id IN (' + ids.map(() => '?').join(',') + ') AND is_read=0').get(...ids).c;
     return res.json({ notifications: rows, unreadCount: unread });
   }
   let sql = 'SELECT n.*, s.name student_name, s.class_name, u.username parent_username FROM notifications n JOIN students s ON s.id=n.student_id LEFT JOIN users u ON u.id=n.parent_user_id WHERE 1=1';
@@ -1398,7 +1520,7 @@ app.post('/api/notifications/:id/read', requireAuth, (req, res) => {
   if (role === 'teacher') return res.status(403).json({ error: 'Teachers have no parent notifications' });
   const n = db.prepare('SELECT * FROM notifications WHERE id=?').get(req.params.id);
   if (!n) return res.status(404).json({ error: 'Not found' });
-  if (role === 'parent' && n.student_id !== req.session.studentId) return res.status(403).json({ error: 'You can only read your own child notifications' });
+  if (role === 'parent' && !linkedChildIds(req).includes(n.student_id)) return res.status(403).json({ error: 'You can only read your own child notifications' });
   db.prepare('UPDATE notifications SET is_read=1 WHERE id=?').run(req.params.id);
   res.json({ ok: true });
 });
@@ -1406,8 +1528,9 @@ app.post('/api/notifications/read-all', requireAuth, (req, res) => {
   const role = req.session.role || 'admin';
   if (role === 'teacher') return res.status(403).json({ error: 'Teachers have no parent notifications' });
   if (role === 'parent') {
-    if (!req.session.studentId) return res.status(403).json({ error: 'No child linked to this parent account' });
-    const r = db.prepare('UPDATE notifications SET is_read=1 WHERE student_id=? AND is_read=0').run(req.session.studentId);
+    const ids = linkedChildIds(req);
+    if (!ids.length) return res.status(403).json({ error: 'No child linked to this parent account' });
+    const r = db.prepare('UPDATE notifications SET is_read=1 WHERE student_id IN (' + ids.map(() => '?').join(',') + ') AND is_read=0').run(...ids);
     return res.json({ ok: true, marked: r.changes });
   }
   const r = db.prepare('UPDATE notifications SET is_read=1 WHERE is_read=0').run();

@@ -274,6 +274,29 @@ pick role **Parent**, enter parent phone + student roll no + class (exactly
 as in the school record), a username and a password. The server links the
 account to that one student only — a wrong phone/roll/class is rejected.
 
+### Auto parent login when a student is added (no registration needed)
+
+When admin adds a new student (Students → Add Student), the parent login
+is created **automatically** and shown to the admin right away, so it can
+be given to the parent:
+
+- **Username:** `parent-<first-name>-<class>-<roll>` — e.g. `parent-ali-1-05`
+  for Ali, Class 1, Roll 05 (a `-2`, `-3` suffix is added if the name is
+  taken). **Password:** `parent123`.
+- **Same phone = same login:** if a brother/sister with the same parent
+  phone already has a parent login, that login is reused for the new
+  child — no second account. One parent login can see all their children
+  (My Child tab lists every linked child; the dashboard shows the first).
+- The parent sees **only their own child(ren)** — never another child.
+  Editing an old student who never got a parent login creates one too.
+- The parent login is also shown in the student profile (admin only:
+  **Parent login** line). A parent who registered themself with their own
+  password keeps that password — it is never shown back; the profile
+  then says the password was set by the parent.
+- Self-registration for a child who already has a parent login is
+  refused, naming the existing username — so a child never gets two
+  parent accounts.
+
 ### Role permissions
 
 | Feature | Admin | Teacher | Parent |
