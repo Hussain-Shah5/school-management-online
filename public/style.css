@@ -116,6 +116,31 @@ td small{color:var(--muted)}
 .modal{position:fixed;inset:0;background:rgba(14,59,34,.55);display:flex;align-items:center;justify-content:center;padding:16px;z-index:30;backdrop-filter:blur(2px)}
 .modal>div{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:22px;max-width:580px;width:100%;max-height:90vh;overflow:auto;box-shadow:0 20px 50px rgba(0,0,0,.28)}
 
+/* ---- Weekly timetable as a table (Period rows x Mon-Sat columns) ---- */
+.tt-wrap{overflow-x:auto;margin:10px 0;border:1px solid var(--line);border-radius:var(--r-md)}
+.tt-table{min-width:760px;margin:0;border:0}
+.tt-table th,.tt-table td{vertical-align:top;text-align:center}
+.tt-table thead th{background:var(--board-2);color:#fff}
+.tt-table thead th small{color:var(--gold-soft);font-weight:400}
+.tt-table .tt-period{background:#f3ecd4;color:var(--board-2);font-weight:700;text-align:left;white-space:nowrap;min-width:110px}
+.tt-table .tt-period small{color:var(--muted);font-weight:600}
+.tt-cell b{color:var(--board-2)}
+.tt-cell small{display:block;color:var(--muted);line-height:1.35}
+.tt-match{background:var(--gold-soft)!important;outline:2px solid var(--gold);outline-offset:-2px}
+.tt-match b{color:#7c5a12}
+.tt-free{color:var(--muted);background:#fbf7ea}
+.tt-free small{color:#a8a58e}
+.tt-break td{background:var(--gold-soft);color:#7c5a12;font-weight:700;text-align:center;border-bottom:1px solid var(--line)}
+@media(max-width:760px){.tt-table{min-width:680px}}
+
+/* ---- Assignment chips + full teacher profile ---- */
+.chip{display:inline-flex;align-items:center;gap:6px;background:var(--board-soft);color:var(--board-2);border:1px solid #bcd8c2;border-radius:999px;padding:4px 6px 4px 12px;font-size:13px;font-weight:650;margin:0 6px 6px 0}
+.chip-x{background:var(--board-2);color:#fff;border:0;border-radius:50%;width:20px;height:20px;padding:0;font-size:13px;line-height:1;box-shadow:none;min-width:20px}
+.chip-x:hover{background:var(--red)}
+.profile-grid{display:grid;grid-template-columns:1fr 1fr;gap:2px 18px;margin:6px 0}
+.profile-grid p{margin:5px 0;font-size:14px}
+@media(max-width:560px){.profile-grid{grid-template-columns:1fr}}
+
 /* ---- Fixed bottom nav (mobile) ---- */
 .bottom-nav{display:none}
 @media(max-width:760px){
