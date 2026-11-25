@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS students (
   name TEXT NOT NULL, father_name TEXT DEFAULT '', class_name TEXT NOT NULL,
   section TEXT DEFAULT 'A', roll_no TEXT DEFAULT '', phone TEXT DEFAULT '',
   monthly_fee INTEGER DEFAULT 0, admission_date TEXT DEFAULT '',
+  b_form_no TEXT DEFAULT '',
   status TEXT DEFAULT 'active'
 );
 CREATE TABLE IF NOT EXISTS attendance (
@@ -53,7 +54,8 @@ CREATE TABLE IF NOT EXISTS results (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   student_id INTEGER NOT NULL, exam TEXT NOT NULL, subject TEXT NOT NULL,
   marks INTEGER NOT NULL, total_marks INTEGER NOT NULL DEFAULT 100,
-  UNIQUE(student_id, exam, subject)
+  class_name TEXT DEFAULT '',
+  UNIQUE(student_id, exam, subject, class_name)
 );
 CREATE TABLE IF NOT EXISTS teachers (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -123,6 +125,59 @@ function ensureUserColumns() {
   if (!cols.includes('role')) db.exec("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'");
   if (!cols.includes('teacher_id')) db.exec('ALTER TABLE users ADD COLUMN teacher_id INTEGER');
   if (!cols.includes('student_id')) db.exec('ALTER TABLE users ADD COLUMN student_id INTEGER');
+}
+// New teacher-profile fields (full-info form): father_name, cnic, dob,
+// email, address, experience, joining_date. Older databases (already
+// deployed on Railway) do not have these columns — add them on startup
+// so the 14 seeded teachers keep working with the new fields empty.
+function ensureTeacherColumns() {
+  const cols = db.prepare("PRAGMA table_info(teachers)").all().map(c => c.name);
+  const add = [
+    ['father_name', "ALTER TABLE teachers ADD COLUMN father_name TEXT DEFAULT ''"],
+    ['cnic', "ALTER TABLE teachers ADD COLUMN cnic TEXT DEFAULT ''"],
+    ['dob', "ALTER TABLE teachers ADD COLUMN dob TEXT DEFAULT ''"],
+    ['email', "ALTER TABLE teachers ADD COLUMN email TEXT DEFAULT ''"],
+    ['address', "ALTER TABLE teachers ADD COLUMN address TEXT DEFAULT ''"],
+    ['experience', "ALTER TABLE teachers ADD COLUMN experience TEXT DEFAULT ''"],
+    ['joining_date', "ALTER TABLE teachers ADD COLUMN joining_date TEXT DEFAULT ''"],
+  ];
+  for (const [col, sql] of add) if (!cols.includes(col)) db.exec(sql);
+}
+// Results now record the class they belong to, so a student's profile can
+// show previous-class results separately from the current class. Older
+// databases have no class_name column on results — add it on startup and
+// backfill existing rows with the student's current class (Mid Term 2026
+// was taken in the current class). Promotion records already carry the
+// previous class + exam + percentage, and are shown alongside.
+function ensureResultsClassColumn() {
+  const cols = db.prepare("PRAGMA table_info(results)").all().map(c => c.name);
+  if (!cols.includes('class_name')) db.exec("ALTER TABLE results ADD COLUMN class_name TEXT DEFAULT ''");
+  db.prepare("UPDATE results SET class_name=(SELECT class_name FROM students WHERE students.id=results.student_id) WHERE class_name IS NULL OR class_name=''").run();
+  // Old databases have UNIQUE(student_id, exam, subject) — without the
+  // class, adding the same exam+subject for a previous class would
+  // overwrite the current-class result. Rebuild the table once so the
+  // unique key becomes (student_id, exam, subject, class_name).
+  const sql = (db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='results'").get() || {}).sql || '';
+  if (/UNIQUE\(student_id,\s*exam,\s*subject\)/.test(sql)) {
+    db.exec(`BEGIN IMMEDIATE;
+      CREATE TABLE results_new (id INTEGER PRIMARY KEY AUTOINCREMENT, student_id INTEGER NOT NULL, exam TEXT NOT NULL, subject TEXT NOT NULL, marks INTEGER NOT NULL, total_marks INTEGER NOT NULL DEFAULT 100, class_name TEXT DEFAULT '', UNIQUE(student_id, exam, subject, class_name));
+      INSERT INTO results_new (id, student_id, exam, subject, marks, total_marks, class_name) SELECT id, student_id, exam, subject, marks, total_marks, class_name FROM results;
+      DROP TABLE results;
+      ALTER TABLE results_new RENAME TO results;
+      COMMIT;`);
+  }
+}
+// B-Form (Birth Form) number per student, e.g. 35202-1234567-1. Older
+// databases have no b_form_no column — add it on startup. Demo/seeding
+// note: seeded demo students get deterministic demo B-Form numbers
+// (35202-1000000+id-1) so the field, search and profile can be shown;
+// a real school must replace them with the child's real B-Form via Edit.
+function ensureStudentBFormColumn() {
+  const cols = db.prepare("PRAGMA table_info(students)").all().map(c => c.name);
+  if (!cols.includes('b_form_no')) db.exec("ALTER TABLE students ADD COLUMN b_form_no TEXT DEFAULT ''");
+  const rows = db.prepare("SELECT id FROM students WHERE b_form_no IS NULL OR b_form_no=''").all();
+  const upd = db.prepare('UPDATE students SET b_form_no=? WHERE id=?');
+  for (const r of rows) upd.run('35202-' + String(1000000 + r.id).padStart(7, '0') + '-' + (r.id % 10), r.id);
 }
 function createUser(username, password, schoolName, role, teacherId, studentId) {
   const salt = crypto.randomBytes(16).toString('hex');
@@ -393,7 +448,12 @@ function seed() {
   db.exec('COMMIT');
   console.log('Seed complete: students=' + studentIds.length + ', active=' + active.length + ', teachers=' + teacherIds.length);
 }
+ensureTeacherColumns();
+ensureStudentBFormColumn();
 seed();
+ensureTeacherColumns();
+ensureResultsClassColumn();
+ensureStudentBFormColumn();
 ensureRoleAccounts();
 
 // ---------- app ----------
@@ -508,7 +568,7 @@ app.get('/api/dashboard', requireAuth, (req, res) => {
 
 // students
 app.get('/api/students', requireAuth, (req, res) => {
-  const { class: cls, search, status } = req.query;
+  const { class: cls, search, status, mode, roll } = req.query;
   const role = req.session.role || 'admin';
   if (role === 'parent') {
     if (!req.session.studentId) return res.status(403).json({ error: 'No child linked to this parent account' });
@@ -517,7 +577,16 @@ app.get('/api/students', requireAuth, (req, res) => {
   let sql = 'SELECT * FROM students WHERE 1=1'; const p = [];
   if (cls) { sql += ' AND class_name=?'; p.push(cls); }
   if (status) { sql += ' AND status=?'; p.push(status); }
-  if (search) { sql += ' AND (name LIKE ? OR father_name LIKE ? OR roll_no LIKE ?)'; p.push(`%${search}%`, `%${search}%`, `%${search}%`); }
+  // Search modes (Students tab search bar): name (default), bform, classroll.
+  // - name: name / father name / roll no contains the text.
+  // - bform: B-Form number contains the text (dashes optional in the query).
+  // - classroll: exact Class + Roll No. (class comes from ?class=, roll from ?roll=).
+  if (mode === 'bform' && search) {
+    const q = String(search).replace(/[-\s]/g, '');
+    sql += ' AND REPLACE(REPLACE(b_form_no, \'-\', \'\'), \' \', \'\') LIKE ?'; p.push(`%${q}%`);
+  } else if (mode === 'classroll') {
+    if (roll) { const r = String(roll).trim(); sql += ' AND (roll_no=? OR roll_no=?)'; p.push(r, r.padStart(2, '0')); }
+  } else if (search) { sql += ' AND (name LIKE ? OR father_name LIKE ? OR roll_no LIKE ? OR b_form_no LIKE ?)'; p.push(`%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`); }
   if (role === 'teacher') {
     const my = teacherClasses(req);
     if (!my.length) return res.json([]);
@@ -531,14 +600,14 @@ app.get('/api/classes', requireAuth, (req, res) => res.json(CLASSES));
 app.post('/api/students', requireAdmin, (req, res) => {
   const b = req.body || {};
   if (!b.name || !b.class_name) return res.status(400).json({ error: 'Name and class required' });
-  const r = db.prepare('INSERT INTO students (name,father_name,class_name,section,roll_no,phone,monthly_fee,admission_date,status) VALUES (?,?,?,?,?,?,?,?,?)')
-    .run(b.name, b.father_name || '', b.class_name, b.section || 'A', b.roll_no || '', b.phone || '', b.monthly_fee || 0, b.admission_date || '', 'active');
+  const r = db.prepare('INSERT INTO students (name,father_name,class_name,section,roll_no,phone,monthly_fee,admission_date,b_form_no,status) VALUES (?,?,?,?,?,?,?,?,?,?)')
+    .run(b.name, b.father_name || '', b.class_name, b.section || 'A', b.roll_no || '', b.phone || '', b.monthly_fee || 0, b.admission_date || '', (b.b_form_no || '').trim(), 'active');
   res.json({ ok: true, id: Number(r.lastInsertRowid) });
 });
 app.put('/api/students/:id', requireAdmin, (req, res) => {
   const b = req.body || {};
-  db.prepare('UPDATE students SET name=?,father_name=?,class_name=?,section=?,roll_no=?,phone=?,monthly_fee=?,admission_date=? WHERE id=?')
-    .run(b.name, b.father_name || '', b.class_name, b.section || 'A', b.roll_no || '', b.phone || '', b.monthly_fee || 0, b.admission_date || '', req.params.id);
+  db.prepare('UPDATE students SET name=?,father_name=?,class_name=?,section=?,roll_no=?,phone=?,monthly_fee=?,admission_date=?,b_form_no=? WHERE id=?')
+    .run(b.name, b.father_name || '', b.class_name, b.section || 'A', b.roll_no || '', b.phone || '', b.monthly_fee || 0, b.admission_date || '', (b.b_form_no || '').trim(), req.params.id);
   res.json({ ok: true });
 });
 app.delete('/api/students/:id', requireAdmin, (req, res) => {
@@ -616,7 +685,11 @@ app.get('/api/attendance/summary', requireAuth, (req, res) => {
 // fees
 app.get('/api/fees', requireAdmin, (req, res) => {
   const month = req.query.month || '2026-11';
-  res.json(db.prepare('SELECT f.*, s.name, s.class_name, s.father_name FROM fees f JOIN students s ON s.id=f.student_id WHERE f.month=? ORDER BY s.class_name, s.name').all(month));
+  const { search, class: cls } = req.query;
+  let sql = 'SELECT f.*, s.name, s.class_name, s.father_name, s.b_form_no FROM fees f JOIN students s ON s.id=f.student_id WHERE f.month=?'; const p = [month];
+  if (cls) { sql += ' AND s.class_name=?'; p.push(cls); }
+  if (search) { sql += ' AND (s.name LIKE ? OR s.father_name LIKE ? OR s.roll_no LIKE ? OR s.b_form_no LIKE ?)'; p.push(`%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`); }
+  res.json(db.prepare(sql + ' ORDER BY s.class_name, s.name').all(...p));
 });
 app.post('/api/fees/generate', requireAdmin, (req, res) => {
   const month = (req.body || {}).month || '2026-11';
@@ -638,10 +711,11 @@ app.post('/api/fees/:id/pay', requireAdmin, (req, res) => {
 
 // results
 app.get('/api/results', requireAuth, (req, res) => {
-  const { exam, class: cls } = req.query;
-  let sql = 'SELECT r.*, s.name, s.class_name FROM results r JOIN students s ON s.id=r.student_id WHERE 1=1'; const p = [];
+  const { exam, class: cls, search } = req.query;
+  let sql = 'SELECT r.*, s.name, s.class_name, s.roll_no FROM results r JOIN students s ON s.id=r.student_id WHERE 1=1'; const p = [];
   if (exam) { sql += ' AND r.exam=?'; p.push(exam); }
   if (cls) { sql += ' AND s.class_name=?'; p.push(cls); }
+  if (search) { sql += ' AND (s.name LIKE ? OR s.roll_no LIKE ? OR r.subject LIKE ?)'; p.push(`%${search}%`, `%${search}%`, `%${search}%`); }
   let rows = db.prepare(sql + ' ORDER BY s.class_name, s.name, r.subject').all(...p);
   const role = req.session.role || 'admin';
   if (role === 'parent') rows = rows.filter(r => r.student_id === req.session.studentId);
@@ -651,11 +725,28 @@ app.get('/api/results', requireAuth, (req, res) => {
   }
   res.json(rows);
 });
-app.post('/api/results', requireAdmin, (req, res) => {
+app.post('/api/results', requireRole('admin', 'teacher'), (req, res) => {
   const b = req.body || {};
   if (!b.student_id || !b.exam || !b.subject) return res.status(400).json({ error: 'student, exam and subject required' });
-  db.prepare('INSERT INTO results (student_id,exam,subject,marks,total_marks) VALUES (?,?,?,?,?) ON CONFLICT(student_id,exam,subject) DO UPDATE SET marks=excluded.marks, total_marks=excluded.total_marks')
-    .run(b.student_id, b.exam, b.subject, b.marks || 0, b.total_marks || 100);
+  const marks = Number(b.marks), totalMarks = Number(b.total_marks) || 100;
+  if (!Number.isFinite(marks) || marks < 0 || marks > totalMarks) return res.status(400).json({ error: 'Marks must be between 0 and total marks (' + totalMarks + ')' });
+  const st = db.prepare('SELECT * FROM students WHERE id=?').get(b.student_id);
+  if (!st) return res.status(404).json({ error: 'Student not found' });
+  // The result can belong to the student's current class OR a previous
+  // class (chosen in the Add Result form) — that is how previous-class
+  // results are added. Default: the student's current class.
+  const resultClass = CLASSES.includes(b.class_name) ? b.class_name : st.class_name;
+  // Teachers may only add results for their own assigned class+subject.
+  if ((req.session.role || 'admin') === 'teacher') {
+    const ok = db.prepare('SELECT 1 FROM teacher_assignments WHERE teacher_id=? AND class_name=? AND subject=?').get(req.session.teacherId, resultClass, b.subject);
+    if (!ok) return res.status(403).json({ error: 'You can only add results for your own assigned subjects (Class ' + resultClass + ' ' + b.subject + ' is not assigned to you)' });
+  }
+  db.prepare('INSERT INTO results (student_id,exam,subject,marks,total_marks,class_name) VALUES (?,?,?,?,?,?) ON CONFLICT(student_id,exam,subject,class_name) DO UPDATE SET marks=excluded.marks, total_marks=excluded.total_marks')
+    .run(b.student_id, b.exam, b.subject, marks, totalMarks, resultClass);
+  res.json({ ok: true, class_name: resultClass });
+});
+app.delete('/api/results/:id', requireAdmin, (req, res) => {
+  db.prepare('DELETE FROM results WHERE id=?').run(req.params.id);
   res.json({ ok: true });
 });
 
@@ -669,7 +760,12 @@ app.get('/api/teachers', requireAuth, (req, res) => {
     delete t.salary;
     return res.json([{ ...t, assignments: db.prepare('SELECT * FROM teacher_assignments WHERE teacher_id=?').all(t.id) }]);
   }
-  const teachers = db.prepare('SELECT * FROM teachers ORDER BY name').all();
+  const { search } = req.query;
+  let teachers = db.prepare('SELECT * FROM teachers ORDER BY name').all();
+  if (search) {
+    const q = String(search).toLowerCase();
+    teachers = teachers.filter(t => (t.name + ' ' + (t.designation || '') + ' ' + (t.qualification || '') + ' ' + (t.subjects || '') + ' ' + (t.phone || '')).toLowerCase().includes(q));
+  }
   res.json(teachers.map(t => ({
     ...t,
     assignments: db.prepare('SELECT * FROM teacher_assignments WHERE teacher_id=?').all(t.id),
@@ -678,9 +774,45 @@ app.get('/api/teachers', requireAuth, (req, res) => {
 app.post('/api/teachers', requireAdmin, (req, res) => {
   const b = req.body || {};
   if (!b.name) return res.status(400).json({ error: 'Name required' });
-  const r = db.prepare('INSERT INTO teachers (name,designation,qualification,salary,phone,subjects) VALUES (?,?,?,?,?,?)')
-    .run(b.name, b.designation || '', b.qualification || '', b.salary || 0, b.phone || '', b.subjects || '');
-  res.json({ ok: true, id: Number(r.lastInsertRowid) });
+  // Assignments may come as an array [{class_name, subject}] — derive the
+  // teacher's subjects list from them; fall back to the plain subjects string.
+  const assignments = Array.isArray(b.assignments) ? b.assignments.filter(a => a && a.class_name && a.subject) : [];
+  const subjects = assignments.length
+    ? [...new Set(assignments.map(a => a.subject))].join(', ')
+    : (b.subjects || '');
+  const r = db.prepare('INSERT INTO teachers (name,father_name,cnic,dob,email,address,experience,joining_date,designation,qualification,salary,phone,subjects) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
+    .run(b.name, b.father_name || '', b.cnic || '', b.dob || '', b.email || '', b.address || '', b.experience || '', b.joining_date || '', b.designation || '', b.qualification || '', b.salary || 0, b.phone || '', subjects);
+  const teacherId = Number(r.lastInsertRowid);
+  const insAssign = db.prepare('INSERT OR IGNORE INTO teacher_assignments (teacher_id,class_name,subject) VALUES (?,?,?)');
+  for (const a of assignments) insAssign.run(teacherId, a.class_name, a.subject);
+  // Create the teacher's login immediately (no server restart needed).
+  // Username = first name, lowercase (Muhammad Asif -> asif, as in the seed);
+  // if that username is taken, append 2, 3, ... Password is teacher123.
+  let loginUsername = teacherUsername(b.name);
+  let suffix = 2;
+  while (db.prepare('SELECT id FROM users WHERE username=?').get(loginUsername)) {
+    loginUsername = teacherUsername(b.name) + suffix++;
+  }
+  createUser(loginUsername, 'teacher123', 'Demo School', 'teacher', teacherId, null);
+  res.json({ ok: true, id: teacherId, loginUsername, loginPassword: 'teacher123', assignmentsSaved: assignments.length });
+});
+app.put('/api/teachers/:id', requireAdmin, (req, res) => {
+  const b = req.body || {};
+  const t = db.prepare('SELECT * FROM teachers WHERE id=?').get(req.params.id);
+  if (!t) return res.status(404).json({ error: 'Teacher not found' });
+  if (!b.name) return res.status(400).json({ error: 'Name required' });
+  // Full-info edit: every profile field is editable, including for the 14
+  // seeded teachers whose new fields start empty.
+  db.prepare('UPDATE teachers SET name=?,father_name=?,cnic=?,dob=?,email=?,address=?,experience=?,joining_date=?,designation=?,qualification=?,salary=?,phone=?,subjects=? WHERE id=?')
+    .run(b.name, b.father_name || '', b.cnic || '', b.dob || '', b.email || '', b.address || '', b.experience || '', b.joining_date || '', b.designation || '', b.qualification || '', b.salary || 0, b.phone || '', b.subjects || t.subjects || '', req.params.id);
+  // If assignments were sent, replace them (so edits can change classes/subjects).
+  if (Array.isArray(b.assignments)) {
+    db.prepare('DELETE FROM teacher_assignments WHERE teacher_id=?').run(req.params.id);
+    const ins = db.prepare('INSERT OR IGNORE INTO teacher_assignments (teacher_id,class_name,subject) VALUES (?,?,?)');
+    const subs = [...new Set(b.assignments.filter(a => a && a.class_name && a.subject).map(a => { ins.run(req.params.id, a.class_name, a.subject); return a.subject; }))];
+    if (subs.length) db.prepare('UPDATE teachers SET subjects=? WHERE id=?').run(subs.join(', '), req.params.id);
+  }
+  res.json({ ok: true });
 });
 app.get('/api/teachers/:id', requireAuth, (req, res) => {
   const role = req.session.role || 'admin';
@@ -711,10 +843,16 @@ app.post('/api/staff-attendance', requireAdmin, (req, res) => {
 
 // leaving / promotions
 app.get('/api/leaving', requireAdmin, (req, res) => {
-  res.json(db.prepare('SELECT l.*, s.name, s.father_name, s.phone FROM leaving_records l JOIN students s ON s.id=l.student_id ORDER BY l.leaving_date DESC').all());
+  const { search } = req.query;
+  let sql = 'SELECT l.*, s.name, s.father_name, s.phone FROM leaving_records l JOIN students s ON s.id=l.student_id WHERE 1=1'; const p = [];
+  if (search) { sql += ' AND (s.name LIKE ? OR s.father_name LIKE ? OR l.reason LIKE ? OR l.slc_number LIKE ?)'; p.push(`%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`); }
+  res.json(db.prepare(sql + ' ORDER BY l.leaving_date DESC').all(...p));
 });
 app.get('/api/promotions', requireAdmin, (req, res) => {
-  res.json(db.prepare('SELECT p.*, s.name, s.class_name FROM promotions p JOIN students s ON s.id=p.student_id ORDER BY p.date DESC, s.name LIMIT 500').all());
+  const { search } = req.query;
+  let sql = 'SELECT p.*, s.name, s.class_name FROM promotions p JOIN students s ON s.id=p.student_id WHERE 1=1'; const p = [];
+  if (search) { sql += ' AND (s.name LIKE ? OR p.exam LIKE ?)'; p.push(`%${search}%`, `%${search}%`); }
+  res.json(db.prepare(sql + ' ORDER BY p.date DESC, s.name LIMIT 500').all(...p));
 });
 
 // timetable
@@ -762,10 +900,10 @@ app.get('/api/export/students', requireAdmin, (req, res) => {
   const { class: cls, search } = req.query;
   let sql = 'SELECT * FROM students WHERE 1=1'; const p = [];
   if (cls) { sql += ' AND class_name=?'; p.push(cls); }
-  if (search) { sql += ' AND (name LIKE ? OR father_name LIKE ? OR roll_no LIKE ?)'; p.push(`%${search}%`, `%${search}%`, `%${search}%`); }
+  if (search) { sql += ' AND (name LIKE ? OR father_name LIKE ? OR roll_no LIKE ? OR b_form_no LIKE ?)'; p.push(`%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`); }
   const rows = db.prepare(sql + ' ORDER BY class_name, CAST(roll_no AS INTEGER)').all(...p);
-  sendCsv(res, 'students.csv', ['ID', 'Name', 'Father Name', 'Class', 'Section', 'Roll No', 'Parent Phone', 'Monthly Fee (Rs)', 'Admission Date', 'Status'],
-    rows.map(s => [s.id, s.name, s.father_name, s.class_name, s.section, s.roll_no, s.phone, s.monthly_fee, s.admission_date, s.status]));
+  sendCsv(res, 'students.csv', ['ID', 'Name', 'Father Name', 'Class', 'Section', 'Roll No', 'Parent Phone', 'B-Form No', 'Monthly Fee (Rs)', 'Admission Date', 'Status'],
+    rows.map(s => [s.id, s.name, s.father_name, s.class_name, s.section, s.roll_no, s.phone, s.b_form_no || '', s.monthly_fee, s.admission_date, s.status]));
 });
 app.get('/api/export/fees', requireAdmin, (req, res) => {
   const month = req.query.month || '2026-11';

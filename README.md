@@ -11,8 +11,41 @@ all data is saved on the server in `data/school.db` via the Express API.
 - **Dashboard** — active students, present today, fees collected / pending,
   teachers, staff present, left / promoted counts, students per class.
 - **Students** — add / edit / delete, Nursery, KG, 1–10, roll no, father name,
-  parent phone, monthly fee, admission date, search + class filter, full profile
+  parent phone, monthly fee, admission date, **B-Form No.** (Birth Form number,
+  e.g. `35202-1234567-1`), search + class filter, full profile
   (attendance, fees, results, promotions, leaving record).
+  - **B-Form No.:** Add/Edit Student form mein B-Form No. ka field hai; ye
+    save hota hai, student ki profile mein dikhta hai, students list mein
+    B-Form column hai, aur search bhi B-Form number se hoti hai (name /
+    roll no / B-Form). Column `students.b_form_no` purani databases mein
+    startup par automatically add ho jata hai; seeded demo students ko
+    demo B-Form numbers milte hain (format `35202-1000000+id-1`) — real
+    school inhein Edit se asal B-Form se badal le. Students CSV export
+    mein B-Form No. column bhi hai.
+  - **Search Student (Students tab search bar):** "Search by" dropdown
+    mein 3 options hain — **Naam se** (name / father name), **B-Form No.
+    se** (dashes ke saath ya baghair — `3520212345671` bhi chal jata hai),
+    aur **Class + Roll No. se** (class select karein + roll no likhein,
+    e.g. Class 1 + Roll 01). Search karte hi sirf wohi student(s) list
+    mein dikhte hain, aur **Profile** button se us student ki poori
+    profile khulti hai. Server API: `GET /api/students?mode=name|bform|
+    classroll&search=...&class=...&roll=...` (teacher sirf apni classes
+    mein search kar sakta hai; parent sirf apna bacha dekhta hai).
+  - **Search in every section:** har list wale section mein kaam karne
+    wala search bar hai (sirf dikhane ke liye nahi):
+    - **Fees** — student naam / roll / B-Form se + class filter.
+    - **Results** — student naam / roll / subject se + class filter.
+    - **Teachers & Staff** — teacher naam / subject / designation se.
+    - **Attendance** — naam se (is class ki list mein foran filter hota
+      hai; mark ki hui Present/Absent choice filter se nahi badalti).
+    - **Timetable** — subject / teacher naam se; matching periods grid
+      mein gold highlight hote hain aur neeche un ki list (Day, Period,
+      Class, Subject, Teacher, Time) dikhti hai.
+    - **Leaving / Promoted** — student naam / wajah / SLC number / exam se
+      (dono tables ek saath filter hoti hain).
+    Server APIs: `GET /api/fees?search=&class=`,
+    `GET /api/results?search=&class=`, `GET /api/teachers?search=`,
+    `GET /api/leaving?search=`, `GET /api/promotions?search=`.
 - **Attendance** — date-wise Present / Absent / Late / Leave, bulk mark,
   monthly % summary (API: `/api/attendance/summary`).
 - **Fees** — generate monthly challans, Cash / JazzCash / EasyPaisa / Bank,
@@ -23,6 +56,46 @@ all data is saved on the server in `data/school.db` via the Express API.
   phone, class + subject assignments, staff attendance + monthly %, teacher
   profile with **subject-wise student progress % bars computed from real
   Mid Term 2026 results**.
+  - **Add Teacher / Staff (admin only):** Teachers & Staff tab → **+ Add Teacher / Staff**.
+    Full-info form: full name, father name, CNIC / ID card number, date of
+    birth, phone, email (optional), home address, qualification, experience,
+    salary, date of joining, designation/post, and class + subject
+    assignments (add as many as needed). Saving creates the teacher AND
+    their login immediately — username = first name in small letters
+    (e.g. `ali` for Ali Raza), password `teacher123`. No server restart
+    needed. The new fields are stored in the `teachers` table
+    (`father_name`, `cnic`, `dob`, `email`, `address`, `experience`,
+    `joining_date` — added automatically on startup for older databases,
+    so the 14 seeded teachers keep working with those fields empty).
+    Any teacher's profile can be edited later (Profile → Edit Profile,
+    or Edit button in the list) — this is how the seeded teachers'
+    empty fields are filled in.
+  - **Add Result (admin, or teacher for their own subjects):** Results tab →
+    **+ Add Result**. Search the student by name / roll no / class, pick
+    **class** (default: the student's current class — change it to a
+    previous class to add a previous-class result), exam, subject and
+    marks obtained / total marks, Save. Teachers only see their own
+    assigned subjects for the chosen class (the server rejects anything
+    else with 403). The new result shows at once in the Results list,
+    in the student's profile, and updates their total / percentage / grade.
+    Results are stored with their class (`results.class_name`, added
+    automatically on startup for older databases; existing Mid Term 2026
+    results are backfilled to each student's current class, and the
+    unique key is now student + exam + subject + class, so the same
+    exam/subject in two different classes no longer overwrites each other).
+  - **Previous Class Results (student profile):** opening a student's
+    profile shows the current class result first, then a separate
+    **“Previous Class Results”** section — exam, class, total marks,
+    percentage, grade and year. It lists (a) grouped subject results
+    added for a previous class, and (b) the student's promotion
+    records (exam, previous class, percentage, year), so a promoted
+    student's old class result is visible even before any detailed
+    previous-class result is added.
+  - **Teacher timetable as a table:** in a teacher's profile AND in My
+    Timetable, the weekly timetable is a proper table — rows = Period 1–6
+    (with a Break row after Period 3), columns = Mon, Tue, Wed, Thu, Fri,
+    Sat. Each cell shows Subject + Class + Time; empty cells show
+    "— Free". On a phone it scrolls sideways with clear headers.
 - **Leaving / Promoted** — leaving record (date, reason, last class, SLC number);
   promotion history (from → to class, exam, percentage).
 - **Timetable** — all 12 classes, Mon–Sat, 6 periods + break, teacher + subject
@@ -203,7 +276,9 @@ this app because it keeps the SQLite file on a volume.
 `POST /api/students/:id/promote`, `GET/POST /api/attendance`,
 `GET /api/attendance/summary`,
 `GET /api/fees`, `POST /api/fees/generate`, `POST /api/fees/:id/pay`,
-`GET/POST /api/results`, `GET/POST /api/teachers`,
+`GET/POST /api/results` (POST: admin, or teacher for own subjects),
+`DELETE /api/results/:id` (admin),
+`GET/POST /api/teachers`, `PUT /api/teachers/:id` (admin, full-info edit),
 `GET /api/teachers/:id`, `POST /api/teachers/:id/assignments`,
 `GET/POST /api/staff-attendance`,
 `GET /api/leaving`, `GET /api/promotions`,
