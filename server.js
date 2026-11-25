@@ -117,6 +117,87 @@ function grade(pct) {
   if (pct >= 60) return 'C'; if (pct >= 50) return 'D'; return 'F';
 }
 
+// ---------- conflict-free timetable builder ----------
+// FAULT FIXED: the old builder gave every class the SAME subject in the
+// same Day+Period slot (identical rotation for all classes) and picked the
+// first teacher for that subject — so e.g. Fatima Zahra (the only English
+// teacher) was booked in 10 classes at 08:00 on the same day, and Bilal
+// Hussain had 78 periods/week. A teacher is one person: they can teach at
+// most ONE class in a given Day+Period slot.
+// Rules now enforced everywhere (seed, regenerate, startup fix, single
+// period edit): a teacher is booked at most once per Day+Period.
+//   * Subjects are STAGGERED by class (offset = class index + day), so
+//     different classes need different subjects in the same slot.
+//   * Classes are tried in a rotating order per slot, so no class always
+//     gets first pick.
+//   * For each slot, first an available teacher assigned to that
+//     class+subject, else any available teacher for that subject; if none
+//     is free, the period is left Free (teacher_id NULL, subject 'Free')
+//     with a clear note — never double-booked. Free is honest: e.g. only
+//     one English teacher exists (36 slots/week) but English is needed in
+//     72 slots/week, so some English periods must be Free until the school
+//     hires another English teacher.
+const TT_DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const TT_TIMES = [['08:00', '08:45'], ['08:45', '09:30'], ['09:30', '10:15'], ['10:45', '11:30'], ['11:30', '12:15'], ['12:15', '13:00']];
+function buildTimetableRows() {
+  const assignRows = db.prepare('SELECT teacher_id, class_name, subject FROM teacher_assignments').all();
+  const byClassSubject = new Map(), bySubject = new Map();
+  for (const a of assignRows) {
+    const k = a.class_name + '|' + a.subject;
+    if (!byClassSubject.has(k)) byClassSubject.set(k, []);
+    byClassSubject.get(k).push(a.teacher_id);
+    if (!bySubject.has(a.subject)) bySubject.set(a.subject, []);
+    if (!bySubject.get(a.subject).includes(a.teacher_id)) bySubject.get(a.subject).push(a.teacher_id);
+  }
+  const rows = []; let filled = 0, free = 0;
+  TT_DAYS.forEach((day, di) => {
+    for (let p = 1; p <= 6; p++) {
+      const slotBooked = new Set();
+      // Rotate class order per slot so no class always gets first pick.
+      const order = CLASSES.map((c, i) => CLASSES[(i + di * 6 + p) % CLASSES.length]);
+      for (const cls of order) {
+        const clsIdx = CLASSES.indexOf(cls);
+        const subs = subjectsForClass(cls);
+        const subj = subs[(clsIdx + di + p - 1) % subs.length];
+        const candidates = [
+          ...(byClassSubject.get(cls + '|' + subj) || []),
+          ...(bySubject.get(subj) || []),
+        ];
+        const teacherId = candidates.find(id => !slotBooked.has(id)) || null;
+        if (teacherId) { slotBooked.add(teacherId); filled++; rows.push({ class_name: cls, day, period: p, subject: subj, teacher_id: teacherId, start_time: TT_TIMES[p - 1][0], end_time: TT_TIMES[p - 1][1] }); }
+        else { free++; rows.push({ class_name: cls, day, period: p, subject: 'Free', teacher_id: null, start_time: TT_TIMES[p - 1][0], end_time: TT_TIMES[p - 1][1] }); }
+      }
+    }
+  });
+  return { rows, filled, free };
+}
+function insertTimetableRows(rows) {
+  const addTT = db.prepare('INSERT INTO timetable (class_name,day,period,subject,teacher_id,start_time,end_time) VALUES (?,?,?,?,?,?,?)');
+  for (const r of rows) addTT.run(r.class_name, r.day, r.period, r.subject, r.teacher_id, r.start_time, r.end_time);
+}
+function countTimetableConflicts() {
+  const row = db.prepare(`SELECT COALESCE(SUM(c-1),0) e FROM (SELECT COUNT(*) c FROM timetable WHERE teacher_id IS NOT NULL GROUP BY day,period,teacher_id HAVING c>1)`).get();
+  return row ? row.e : 0;
+}
+// Fix an existing timetable that double-books teachers: if any teacher
+// appears twice in the same Day+Period, rebuild the whole timetable
+// conflict-free. Patching duplicates one by one would leave ~300 Free
+// periods (the old rotation booked the same teacher in up to 10 classes
+// per slot); a rebuild with staggered subjects fills ~336 of 432 slots.
+// Idempotent: no-op when the timetable is already conflict-free.
+function fixTimetableConflicts() {
+  try {
+    const extra = countTimetableConflicts();
+    if (!extra) return 0;
+    console.log('fixTimetableConflicts: ' + extra + ' double-booked timetable rows found — rebuilding conflict-free timetable');
+    db.prepare('DELETE FROM timetable').run();
+    const { rows, filled, free } = buildTimetableRows();
+    insertTimetableRows(rows);
+    console.log('fixTimetableConflicts: rebuilt — filled=' + filled + ' free=' + free + ' conflicts=0');
+    return extra;
+  } catch (e) { console.log('fixTimetableConflicts skipped: ' + e.message); return 0; }
+}
+
 // ---------- roles, CSV, backup helpers ----------
 // Existing databases (already deployed on Railway) have a users table
 // without role/teacher_id/student_id — add the columns on startup.
@@ -452,25 +533,12 @@ function seed() {
   mkDay('2026-11-24', 228, 8, 4); // +1 Leave = 241
   mkDay('2026-11-25', 230, 7, 3); // +1 Leave = 241
   console.log('seed: timetable start');
-  // timetable: 12 classes x Mon-Sat x 6 periods = 432
-  const addTT = db.prepare('INSERT INTO timetable (class_name,day,period,subject,teacher_id,start_time,end_time) VALUES (?,?,?,?,?,?,?)');
-  const days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-  const times = [['08:00', '08:45'], ['08:45', '09:30'], ['09:30', '10:15'], ['10:45', '11:30'], ['11:30', '12:15'], ['12:15', '13:00']];
-  const teacherFor = (cls, subj) => {
-    const row = db.prepare('SELECT teacher_id FROM teacher_assignments WHERE class_name=? AND subject=? LIMIT 1').get(cls, subj);
-    if (row) return row.teacher_id;
-    const row2 = db.prepare('SELECT teacher_id FROM teacher_assignments WHERE subject=? LIMIT 1').get(subj);
-    return row2 ? row2.teacher_id : teacherIds[0].id;
-  };
-  for (const cls of CLASSES) {
-    const subs = subjectsForClass(cls);
-    days.forEach((day, di) => {
-      for (let p = 1; p <= 6; p++) {
-        const subj = subs[(di * 6 + p - 1) % subs.length];
-        addTT.run(cls, day, p, subj, teacherFor(cls, subj), times[p - 1][0], times[p - 1][1]);
-      }
-    });
-  }
+  // timetable: 12 classes x Mon-Sat x 6 periods = 432, built conflict-free
+  // (a teacher is booked at most once per Day+Period; unfillable slots
+  // are left Free — see buildTimetableRows()).
+  const built = buildTimetableRows();
+  insertTimetableRows(built.rows);
+  console.log('seed: timetable filled=' + built.filled + ' free=' + built.free + ' conflicts=' + countTimetableConflicts());
   db.exec('COMMIT');
   console.log('Seed complete: students=' + studentIds.length + ', active=' + active.length + ', teachers=' + teacherIds.length);
 }
@@ -481,6 +549,7 @@ ensureTeacherColumns();
 ensureResultsClassColumn();
 ensureStudentBFormColumn();
 ensureRoleAccounts();
+fixTimetableConflicts();
 
 // ---------- app ----------
 const app = express();
@@ -947,27 +1016,55 @@ app.get('/api/timetable', requireAuth, (req, res) => {
   res.json(db.prepare(sql + ' ORDER BY tt.day, tt.period').all(...p));
 });
 app.post('/api/timetable/regenerate', requireAdmin, (req, res) => {
-  // Rebuild timetable from current teacher assignments (same rotation as seed)
+  // Rebuild timetable from current teacher assignments — conflict-free
+  // (a teacher is booked at most once per Day+Period; see buildTimetableRows).
   db.prepare('DELETE FROM timetable').run();
-  const days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-  const times = [['08:00', '08:45'], ['08:45', '09:30'], ['09:30', '10:15'], ['10:45', '11:30'], ['11:30', '12:15'], ['12:15', '13:00']];
-  const teacherFor = (cls, subj) => {
-    const row = db.prepare('SELECT teacher_id FROM teacher_assignments WHERE class_name=? AND subject=? LIMIT 1').get(cls, subj);
-    if (row) return row.teacher_id;
-    const row2 = db.prepare('SELECT teacher_id FROM teacher_assignments WHERE subject=? LIMIT 1').get(subj);
-    return row2 ? row2.teacher_id : null;
-  };
-  const addTT = db.prepare('INSERT INTO timetable (class_name,day,period,subject,teacher_id,start_time,end_time) VALUES (?,?,?,?,?,?,?)');
-  for (const cls of CLASSES) {
-    const subs = subjectsForClass(cls);
-    days.forEach((day, di) => {
-      for (let p = 1; p <= 6; p++) {
-        const subj = subs[(di * 6 + p - 1) % subs.length];
-        addTT.run(cls, day, p, subj, teacherFor(cls, subj), times[p - 1][0], times[p - 1][1]);
-      }
-    });
+  const { rows, filled, free } = buildTimetableRows();
+  insertTimetableRows(rows);
+  res.json({ ok: true, periods: rows.length, filled, free, conflicts: countTimetableConflicts() });
+});
+// Which teachers are available for one Day+Period slot (admin only).
+// A teacher already teaching another class at that Day+Period is listed
+// as booked (with that class) — the UI must NOT offer them as a choice.
+app.get('/api/timetable/available', requireAdmin, (req, res) => {
+  const { day, period, class: cls } = req.query;
+  if (!TT_DAYS.includes(day) || !period || Number(period) < 1 || Number(period) > 6) return res.status(400).json({ error: 'Day aur Period (1-6) sahi dein.' });
+  const teachers = db.prepare('SELECT id, name, subjects FROM teachers ORDER BY name').all();
+  const booked = db.prepare('SELECT teacher_id, class_name FROM timetable WHERE day=? AND period=? AND teacher_id IS NOT NULL').all(day, Number(period));
+  const bookedById = new Map(booked.map(b => [b.teacher_id, b.class_name]));
+  res.json(teachers.map(t => ({
+    id: t.id, name: t.name, subjects: t.subjects,
+    available: !bookedById.has(t.id) || (cls && bookedById.get(t.id) === cls),
+    bookedClass: bookedById.get(t.id) || null,
+  })));
+});
+// Edit / create a single timetable period (admin only). A teacher who is
+// already booked in another class at the same Day+Period is REFUSED —
+// the timetable must never offer or save that option.
+app.post('/api/timetable/period', requireAdmin, (req, res) => {
+  const b = req.body || {};
+  const cls = String(b.class_name || ''), day = String(b.day || '');
+  const period = Number(b.period);
+  const subject = String(b.subject || '');
+  const teacherId = b.teacher_id === null || b.teacher_id === '' || b.teacher_id === undefined ? null : Number(b.teacher_id);
+  if (!CLASSES.includes(cls)) return res.status(400).json({ error: 'Class sahi dein.' });
+  if (!TT_DAYS.includes(day) || !period || period < 1 || period > 6) return res.status(400).json({ error: 'Day aur Period (1-6) sahi dein.' });
+  if (subject !== 'Free' && !subjectsForClass(cls).includes(subject)) return res.status(400).json({ error: 'Subject is class ke liye sahi nahi hai.' });
+  if (subject === 'Free' && teacherId) return res.status(400).json({ error: 'Free period mein teacher nahi ho sakta.' });
+  if (teacherId) {
+    const teacher = db.prepare('SELECT id, name FROM teachers WHERE id=?').get(teacherId);
+    if (!teacher) return res.status(400).json({ error: 'Teacher nahi mila.' });
+    const clash = db.prepare('SELECT class_name, subject FROM timetable WHERE day=? AND period=? AND teacher_id=? AND class_name<>?').get(day, period, teacherId, cls);
+    if (clash) return res.status(400).json({ error: teacher.name + ' us waqt pehle se Class ' + clash.class_name + ' mein ' + clash.subject + ' parha rahe hain (' + day + ', Period ' + period + ') — ek teacher ek hi waqt par do classes mein nahi ho sakta.' });
+    const assigned = db.prepare('SELECT 1 FROM teacher_assignments WHERE teacher_id=? AND class_name=? AND subject=?').get(teacherId, cls, subject)
+      || db.prepare('SELECT 1 FROM teacher_assignments WHERE teacher_id=? AND subject=?').get(teacherId, subject);
+    if (!assigned) return res.status(400).json({ error: teacher.name + ' ko ' + subject + ' ki assignment nahi hai — pehle teacher ki assignments mein ' + subject + ' add karein.' });
   }
-  res.json({ ok: true, periods: 432 });
+  const times = TT_TIMES[period - 1];
+  db.prepare(`INSERT INTO timetable (class_name,day,period,subject,teacher_id,start_time,end_time) VALUES (?,?,?,?,?,?,?)
+    ON CONFLICT(class_name,day,period) DO UPDATE SET subject=excluded.subject, teacher_id=excluded.teacher_id, start_time=excluded.start_time, end_time=excluded.end_time`)
+    .run(cls, day, period, subject, teacherId, times[0], times[1]);
+  res.json({ ok: true });
 });
 
 // ---------- export & backup (admin only) ----------

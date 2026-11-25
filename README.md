@@ -142,6 +142,17 @@ all data is saved on the server in `data/school.db` via the Express API.
 - **Timetable** — all 12 classes, Mon–Sat, 6 periods + break, teacher + subject
   + time, auto-generated from teacher assignments; each teacher's own weekly
   timetable is in their profile. Regenerate any time.
+- **Timetable rule (no double-booking):** a teacher can teach at most ONE class
+  in the same Day + Period slot. Subjects are staggered by class so different
+  classes need different subjects at the same time; if the teacher for a
+  class+subject is already booked then, the next available teacher for that
+  subject is used, otherwise that period is left **Free**. The old timetable
+  booked e.g. the only English teacher in 10 classes at 08:00 — that can no
+  longer happen. On startup, any existing double-booked timetable is rebuilt
+  conflict-free. In the Timetable tab, admin can **Edit a period**: the teacher
+  dropdown only offers teachers free at that Day + Period (booked teachers are
+  shown disabled, with the class they are already teaching); the server also
+  refuses a booked teacher with a clear error.
 
 ## Demo logins (seeded on first run / on startup)
 
