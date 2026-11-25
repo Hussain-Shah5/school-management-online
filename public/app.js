@@ -613,7 +613,7 @@ function teacherForm(t) {
   </div>
   <label>Designation / Post</label><input id="t_des" placeholder="e.g. Teacher, Senior Teacher, Computer Teacher" list="t_des_list" value="${v('designation')}"><datalist id="t_des_list"><option>Teacher</option><option>Senior Teacher</option><option>Junior Teacher</option><option>Science Teacher</option><option>Computer Teacher</option><option>Qaria</option></datalist>
   <h4>Classes &amp; Subjects (assignments)</h4>
-  <p style="font-size:13px;color:var(--muted)">Class chunein, phir subject chunein, phir “Add assignment” dabayein. Ek teacher ko kayi classes di ja sakti hain — lekin sirf <b>ek hi subject</b> (pehli assignment wala subject hi teacher ka subject ban jata hai, baaki subjects ki assignments save nahi hongi).</p>
+  <p style="font-size:13px;color:var(--muted)">Class chunein, phir subject chunein, phir “Add assignment” dabayein. Ek teacher ko kayi classes di ja sakti hain — lekin sirf <b>ek hi subject</b> (pehli assignment wala subject hi teacher ka subject ban jata hai, baaki subjects ki assignments save nahi hongi). Aur ek class ka ek subject <b>sirf ek teacher</b> ko assign ho sakta hai — jo subject kisi aur teacher ko assign hai wo neeche disabled dikhega.</p>
   <div style="display:grid;grid-template-columns:1fr 1fr auto;gap:8px;align-items:end">
     <div><label>Class</label><select id="t_class">${CLASSES.map(c=>`<option>${c}</option>`).join('')}</select></div>
     <div><label>Subject</label><select id="t_subj"></select></div>
@@ -621,7 +621,23 @@ function teacherForm(t) {
   </div>
   <div id="t_assignList" style="margin-top:8px"></div>
   <div style="display:flex;gap:8px;margin-top:14px"><button id="t_save">${t.id ? 'Update Teacher' : 'Save Teacher (server)'}</button><button class="secondary" onclick="closeModal()">Cancel</button></div>`);
-  const fillSubj = () => { $('#t_subj').innerHTML = subjectsForClass($('#t_class').value).map(s => `<option>${s}</option>`).join(''); };
+  // One teacher per class+subject: subjects already held by ANOTHER
+  // teacher are disabled in the picker (with the holder's name) and
+  // cannot be added. (Server re-checks on save.)
+  const takenBy = {};
+  (teachersCache || []).forEach(ot => {
+    if (t.id && ot.id === t.id) return;
+    (ot.assignments || []).forEach(a => { takenBy[a.class_name + '|' + a.subject] = ot.name; });
+  });
+  const fillSubj = () => {
+    const cls = $('#t_class').value;
+    $('#t_subj').innerHTML = subjectsForClass(cls).map(s => {
+      const holder = takenBy[cls + '|' + s];
+      return holder
+        ? `<option value="${esc(s)}" disabled>${esc(s)} — ${esc(holder)} ko assign hai</option>`
+        : `<option>${esc(s)}</option>`;
+    }).join('');
+  };
   const renderAssign = () => {
     $('#t_assignList').innerHTML = teacherAssignDraft.length
       ? teacherAssignDraft.map((a, i) => `<span class="chip">Class ${esc(a.class_name)} — ${esc(a.subject)} <button type="button" class="chip-x" onclick="window._delAssign(${i})">×</button></span>`).join(' ')
@@ -631,6 +647,8 @@ function teacherForm(t) {
   $('#t_class').onchange = fillSubj; fillSubj(); renderAssign();
   $('#t_addAssign').onclick = () => {
     const a = { class_name: $('#t_class').value, subject: $('#t_subj').value };
+    const holder = takenBy[a.class_name + '|' + a.subject];
+    if (holder) { alert('Class ' + a.class_name + ' ka ' + a.subject + ' pehle se ' + holder + ' ko assign hai — ek class ka ek subject sirf ek teacher ko assign ho sakta hai.'); return; }
     if (!teacherAssignDraft.some(x => x.class_name === a.class_name && x.subject === a.subject)) teacherAssignDraft.push(a);
     renderAssign();
   };
@@ -726,7 +744,7 @@ async function loadTimetable() {
   <div id="ttMatches"></div>
   ${timetableGridHTML(rows, { showClass: me.role === 'teacher', showTeacher: isAdmin, clickable: isAdmin })}
   ${isAdmin ? `<div class="card" style="margin-top:14px"><h3 style="margin-top:0">Edit a period (Admin)</h3>
-  <p style="font-size:13px;color:var(--muted)">Ek teacher ek hi waqt par sirf ek class mein ho sakta hai — jo teacher us Day + Period mein kisi aur class mein pehle se booked hai, wo is list mein <b>nahi</b> aayega (ya disabled dikhega, wajah ke saath). Sirf usi subject ke teacher dikhte hain jo subject aap ne chuna hai — dusre subject ka teacher kabhi offer nahi hota. Koi teacher free nahi to period ko <b>Free</b> rakhein.</p>
+  <p style="font-size:13px;color:var(--muted)">Ek teacher ek hi waqt par sirf ek class mein ho sakta hai — jo teacher us Day + Period mein kisi aur class mein pehle se booked hai, wo is list mein <b>nahi</b> aayega (ya disabled dikhega, wajah ke saath). Sirf usi subject ke teacher dikhte hain jo subject aap ne chuna hai — dusre subject ka teacher kabhi offer nahi hota. Aur ek class ka ek subject sirf usi teacher ko mil sakta hai jis ko wo assign hai — dusra teacher (chahe usi subject ka ho) disabled dikhega. Koi teacher free nahi to period ko <b>Free</b> rakhein.</p>
   <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end">
   <div><label style="margin:0 0 4px">Day</label><select id="epDay" style="max-width:130px">${TT_DAYS.map(d=>`<option>${d}</option>`).join('')}</select></div>
   <div><label style="margin:0 0 4px">Period</label><select id="epPeriod" style="max-width:100px">${[1,2,3,4,5,6].map(p=>`<option value="${p}">Period ${p}</option>`).join('')}</select></div>
@@ -780,14 +798,23 @@ async function loadTimetable() {
       const subj = $('#epSubject').value;
       let list = [];
       try { list = await api('/api/timetable/available?day=' + encodeURIComponent(day) + '&period=' + period + '&class=' + encodeURIComponent(cls) + '&subject=' + encodeURIComponent(subj)); } catch (e) { $('#epMsg').textContent = e.message; return; }
-      const free = list.filter(t => t.available && t.qualified);
+      // One teacher per class+subject: only the assigned holder of this
+      // class+subject is offered; another teacher of the same subject is
+      // shown disabled with the holder's name.
+      const holderName = list.length ? list[0].holderName : null;
+      const free = list.filter(t => t.available && t.qualified && (subj === 'Free' || !holderName || t.isHolder));
+      const notHolder = list.filter(t => t.available && t.qualified && holderName && !t.isHolder);
       const booked = list.filter(t => !t.available);
       const wrongSubject = list.filter(t => t.available && !t.qualified);
       $('#epTeacher').innerHTML = '<option value="">— Free (koi teacher nahi) —</option>'
         + free.map(t => `<option value="${t.id}">${esc(t.name)} (${esc(t.subjects || '')})</option>`).join('')
+        + notHolder.map(t => `<option value="${t.id}" disabled>${esc(t.name)} — Class ${esc(cls)} ka ${esc(subj)} pehle se ${esc(holderName)} ko assign hai</option>`).join('')
         + booked.map(t => `<option value="${t.id}" disabled>${esc(t.name)} — busy: Class ${esc(t.bookedClass || '')} mein pehle se booked</option>`).join('')
         + wrongSubject.map(t => `<option value="${t.id}" disabled>${esc(t.name)} — sirf ${esc(t.subjects || '')} parhate hain, ${esc(subj)} nahi</option>`).join('');
-      $('#epMsg').textContent = subj === 'Free' ? 'Free period — teacher select na karein.' : (free.length ? free.length + ' teacher(s) free hain is waqt (' + esc(subj) + ' ke liye).' : 'Is waqt ' + esc(subj) + ' ka koi teacher free nahi hai — period Free rakhein.');
+      $('#epMsg').textContent = subj === 'Free' ? 'Free period — teacher select na karein.'
+        : holderName && !free.length ? 'Class ' + cls + ' ka ' + subj + ' pehle se ' + holderName + ' ko assign hai — ' + holderName + ' is waqt free nahi hain, period Free rakhein.'
+        : !holderName ? 'Class ' + cls + ' ka ' + subj + ' kisi teacher ko assign nahi hai — pehle Teacher ki assignments mein add karein.'
+        : free.length + ' teacher(s) free hain is waqt (' + esc(subj) + ' ke liye).';
     };
     fillSubjects();
     $('#epDay').onchange = fillTeachers; $('#epPeriod').onchange = fillTeachers; $('#epSubject').onchange = fillTeachers;
@@ -854,12 +881,20 @@ window.openTtCellEdit = async (day, period) => {
     try { list = await api('/api/timetable/available?day=' + encodeURIComponent(day) + '&period=' + period + '&class=' + encodeURIComponent(cls) + '&subject=' + encodeURIComponent(subj) + '&date=' + encodeURIComponent(date)); } catch (e) { $('#ceMsg').textContent = e.message; return; }
     // Free cell rule: ONLY teachers with no class at this Day+Period are
     // offered — busy / on-leave teachers are not listed at all here.
-    const free = list.filter(t => t.available && t.qualified);
+    // One teacher per class+subject: for a normal period only the assigned
+    // holder of this class+subject is offered. Leave (substitute) case is
+    // exempt — any free same-subject teacher may substitute for one date.
+    const holderName = list.length ? list[0].holderName : null;
+    const free = isLeave
+      ? list.filter(t => t.available && t.qualified)
+      : list.filter(t => t.available && t.qualified && (!holderName || t.isHolder));
     const curId = row.teacher_id && !isLeave ? row.teacher_id : null;
     sel.innerHTML = '<option value="">— Free (koi teacher nahi) —</option>'
       + free.map(t => `<option value="${t.id}" ${curId === t.id ? 'selected' : ''}>${esc(t.name)} (${esc(t.subjects || '')})</option>`).join('');
     $('#ceMsg').textContent = free.length
       ? free.length + ' teacher(s) free hain is waqt (' + subj + ' ke liye) — busy ya chhuti wale teachers list mein nahi hain.'
+      : !isLeave && holderName ? 'Class ' + cls + ' ka ' + subj + ' pehle se ' + holderName + ' ko assign hai — ' + holderName + ' is waqt free nahi hain, period Free rakhein.'
+      : !isLeave && !holderName ? 'Class ' + cls + ' ka ' + subj + ' kisi teacher ko assign nahi hai — pehle Teacher ki assignments mein add karein.'
       : 'Is waqt ' + subj + ' ka koi teacher free nahi hai — period Free rakhein ya kisi aur din/period se teacher badlein.';
   };
   $('#ceSubject').onchange = fillTeachers;
