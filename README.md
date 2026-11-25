@@ -68,12 +68,13 @@ all data is saved on the server in `data/school.db` via the Express API.
     teacher opens the Attendance tab it defaults to a class where they
     hold Period 1 today, if they have one. The server enforces the same
     rule (403) so it cannot be bypassed from the browser. Admin can mark
-    attendance for any class. NOTE: in the seeded timetable Period 1 is
-    always the class's first subject (English), so the English teacher of
-    a class holds Period 1 — e.g. on Wednesday Fatima Zahra holds Period
-    1 for 10 of 12 classes. If a school wants a different teacher to mark
-    attendance, change the Period 1 teacher in the timetable (or
-    regenerate it after changing assignments).
+    attendance for any class. NOTE: subjects are staggered by class and
+    day, so Period 1 is a different subject (and teacher) in different
+    classes — e.g. on Monday Fatima Zahra holds Period 1 only for
+    Nursery, Ahmed Raza for Class 1, Maryam Nawaz for Class 10. If a
+    school wants a different teacher to mark attendance, change the
+    Period 1 teacher in the timetable (or regenerate it after changing
+    assignments).
   - **Staff Attendance (separate tab, not student attendance):** admin
     gets a **Staff Attendance** tab and teachers get **My Staff
     Attendance**. Admin lists all teachers, marks Present / Absent / Late
@@ -153,6 +154,24 @@ all data is saved on the server in `data/school.db` via the Express API.
   dropdown only offers teachers free at that Day + Period (booked teachers are
   shown disabled, with the class they are already teaching); the server also
   refuses a booked teacher with a clear error.
+- **Timetable rule (one teacher = one subject):** a teacher teaches exactly
+  ONE subject in every class (Ahmed Raza only Maths, Fatima Zahra only
+  English, …). The old seed gave teachers assignments in subjects that are
+  not theirs — e.g. Bilal Hussain (Chemistry) was shown teaching English,
+  Islamiat, Maths, Social Studies and Urdu — so a teacher's subject kept
+  changing from class to class. Now assignments are only ever in the
+  teacher's own subject; a wrong-subject assignment is deleted on startup
+  (33 deleted in the shipped seed) and refused when added (the old seed
+  never gave Bilal/Hira/Sana any assignment in their own subject at all —
+  13 such assignments are repaired on startup). If no teacher of that
+  subject is free, the period is left **Free** rather than giving it to a
+  teacher of another subject. Edit-a-period only offers free teachers
+  qualified for the chosen subject (others are shown disabled, e.g. “sirf
+  Maths parhate hain”). Result: 336 of 432 periods filled, 96 Free — the
+  Free periods are exactly the supply shortfall (English and Urdu each
+  need 72 slots/week but have 1 teacher = 36; Science and Islamiat each
+  need 48 but have 1 teacher = 36), so they are honest, not a bug. A
+  teacher of a second subject can only be added as a new teacher.
 
 ## Demo logins (seeded on first run / on startup)
 

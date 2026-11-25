@@ -117,6 +117,78 @@ function grade(pct) {
   if (pct >= 60) return 'C'; if (pct >= 50) return 'D'; return 'F';
 }
 
+// ---------- one teacher = one subject ----------
+// A teacher teaches exactly ONE subject, in every class: their primary
+// subject = the first entry in teachers.subjects (seeded teachers have
+// exactly one, e.g. Ahmed Raza only Maths, Fatima Zahra only English).
+// FAULT FIXED (2026-11-26): the old seed loop gave a teacher an assignment
+// in a DIFFERENT subject whenever a class did not offer their own — e.g.
+// Bilal Hussain (Chemistry) got English/Islamiat/Maths/Social Studies/Urdu
+// and zero Chemistry, Hira Shah (Social Studies) got zero Social Studies —
+// so the timetable showed one teacher teaching 4-5 different subjects.
+// The builder then reused those polluted assignments via its bySubject
+// fallback. Rules now enforced everywhere (seed, startup cleanup,
+// builder, regenerate, single period edit, assignment add/edit):
+//   * An assignment only counts if its subject IS the teacher's primary
+//     subject; anything else is deleted on startup and refused on add.
+//   * The builder only ever assigns a teacher to a slot of their own
+//     subject. A teacher of the same subject assigned to another class
+//     MAY cover this class (same subject, different class — that is fine).
+//   * If no teacher of that subject is free, the period is left Free —
+//     never assign a teacher of another subject to fill the gap.
+function primarySubjectOf(teacherRow) {
+  if (!teacherRow || !teacherRow.subjects) return null;
+  const first = String(teacherRow.subjects).split(',')[0].trim();
+  return first || null;
+}
+function teacherPrimaryMap() {
+  return new Map(db.prepare('SELECT id, subjects FROM teachers').all().map(t => [t.id, primarySubjectOf(t)]));
+}
+// Delete assignments whose subject is not the teacher's own subject, and
+// normalise teachers.subjects to that single subject. Fixes databases
+// seeded by the old loop (33 of the 70 seeded assignments are in a subject
+// the teacher does not teach). Then REPAIR what the old loop never gave:
+// a teacher left with no assignment in their own subject at all (e.g.
+// Bilal Hussain had zero Chemistry, Hira Shah zero Social Studies, Sana
+// Malik zero Biology) gets assignments in classes that teach their subject,
+// up to 5, spread evenly — otherwise their subject could never be taught.
+// Idempotent; returns rows deleted.
+function cleanTeacherAssignments() {
+  try {
+    const primary = teacherPrimaryMap();
+    let deleted = 0, normalised = 0, repaired = 0;
+    for (const a of db.prepare('SELECT teacher_id, class_name, subject FROM teacher_assignments').all()) {
+      const p = primary.get(a.teacher_id);
+      if (p && a.subject !== p) { db.prepare('DELETE FROM teacher_assignments WHERE teacher_id=? AND class_name=? AND subject=?').run(a.teacher_id, a.class_name, a.subject); deleted++; }
+    }
+    for (const t of db.prepare('SELECT id, subjects FROM teachers').all()) {
+      const p = primarySubjectOf(t);
+      if (p && String(t.subjects).trim() !== p) { db.prepare('UPDATE teachers SET subjects=? WHERE id=?').run(p, t.id); normalised++; }
+    }
+    const addAssign = db.prepare('INSERT OR IGNORE INTO teacher_assignments (teacher_id,class_name,subject) VALUES (?,?,?)');
+    for (const t of db.prepare('SELECT id, subjects FROM teachers').all()) {
+      const p = primarySubjectOf(t);
+      if (!p) continue;
+      const eligible = CLASSES.filter(c => subjectsForClass(c).includes(p));
+      const target = Math.min(5, eligible.length);
+      let have = db.prepare('SELECT COUNT(*) c FROM teacher_assignments WHERE teacher_id=? AND subject=?').get(t.id, p).c;
+      if (have >= target) continue;
+      // Spread picks first, then any remaining eligible class, until target.
+      for (let i = 0; i < target && have < target; i++) {
+        const r = addAssign.run(t.id, eligible[Math.floor(i * eligible.length / target)], p);
+        if (r.changes) { repaired++; have++; }
+      }
+      for (const cls of eligible) {
+        if (have >= target) break;
+        const r = addAssign.run(t.id, cls, p);
+        if (r.changes) { repaired++; have++; }
+      }
+    }
+    if (deleted || normalised || repaired) console.log('cleanTeacherAssignments: deleted ' + deleted + ' wrong-subject assignment(s), normalised ' + normalised + ' teacher subject(s), repaired ' + repaired + ' missing own-subject assignment(s)');
+    return deleted;
+  } catch (e) { console.log('cleanTeacherAssignments skipped: ' + e.message); return 0; }
+}
+
 // ---------- conflict-free timetable builder ----------
 // FAULT FIXED: the old builder gave every class the SAME subject in the
 // same Day+Period slot (identical rotation for all classes) and picked the
@@ -131,16 +203,21 @@ function grade(pct) {
 //   * Classes are tried in a rotating order per slot, so no class always
 //     gets first pick.
 //   * For each slot, first an available teacher assigned to that
-//     class+subject, else any available teacher for that subject; if none
-//     is free, the period is left Free (teacher_id NULL, subject 'Free')
-//     with a clear note — never double-booked. Free is honest: e.g. only
-//     one English teacher exists (36 slots/week) but English is needed in
-//     72 slots/week, so some English periods must be Free until the school
+//     class+subject, else any available teacher for that subject (same
+//     subject only — see one-teacher-one-subject above); if none is free,
+//     the period is left Free (teacher_id NULL, subject 'Free') with a
+//     clear note — never double-booked. Free is honest: e.g. only one
+//     English teacher exists (36 slots/week) but English is needed in 72
+//     slots/week, so some English periods must be Free until the school
 //     hires another English teacher.
 const TT_DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 const TT_TIMES = [['08:00', '08:45'], ['08:45', '09:30'], ['09:30', '10:15'], ['10:45', '11:30'], ['11:30', '12:15'], ['12:15', '13:00']];
 function buildTimetableRows() {
-  const assignRows = db.prepare('SELECT teacher_id, class_name, subject FROM teacher_assignments').all();
+  const primary = teacherPrimaryMap();
+  // Only assignments in the teacher's OWN subject count — a polluted
+  // assignment (teacher listed for a subject they do not teach) is ignored.
+  const assignRows = db.prepare('SELECT teacher_id, class_name, subject FROM teacher_assignments').all()
+    .filter(a => primary.get(a.teacher_id) && a.subject === primary.get(a.teacher_id));
   const byClassSubject = new Map(), bySubject = new Map();
   for (const a of assignRows) {
     const k = a.class_name + '|' + a.subject;
@@ -179,22 +256,32 @@ function countTimetableConflicts() {
   const row = db.prepare(`SELECT COALESCE(SUM(c-1),0) e FROM (SELECT COUNT(*) c FROM timetable WHERE teacher_id IS NOT NULL GROUP BY day,period,teacher_id HAVING c>1)`).get();
   return row ? row.e : 0;
 }
-// Fix an existing timetable that double-books teachers: if any teacher
-// appears twice in the same Day+Period, rebuild the whole timetable
-// conflict-free. Patching duplicates one by one would leave ~300 Free
-// periods (the old rotation booked the same teacher in up to 10 classes
-// per slot); a rebuild with staggered subjects fills ~336 of 432 slots.
-// Idempotent: no-op when the timetable is already conflict-free.
+// Rows where a teacher is timetabled for a subject that is not their own.
+function countTimetableSubjectFaults() {
+  const primary = teacherPrimaryMap();
+  let bad = 0;
+  for (const r of db.prepare('SELECT teacher_id, subject FROM timetable WHERE teacher_id IS NOT NULL').all()) {
+    if (r.subject !== primary.get(r.teacher_id)) bad++;
+  }
+  return bad;
+}
+// Fix an existing timetable that double-books teachers or shows a teacher
+// teaching a subject that is not theirs: rebuild the whole timetable
+// conflict-free AND subject-consistent. Patching duplicates one by one
+// would leave ~300 Free periods (the old rotation booked the same teacher
+// in up to 10 classes per slot). Idempotent: no-op when the timetable is
+// already conflict-free and subject-consistent.
 function fixTimetableConflicts() {
   try {
     const extra = countTimetableConflicts();
-    if (!extra) return 0;
-    console.log('fixTimetableConflicts: ' + extra + ' double-booked timetable rows found — rebuilding conflict-free timetable');
+    const badSubject = countTimetableSubjectFaults();
+    if (!extra && !badSubject) return 0;
+    console.log('fixTimetableConflicts: ' + extra + ' double-booked row(s), ' + badSubject + ' wrong-subject row(s) found — rebuilding timetable');
     db.prepare('DELETE FROM timetable').run();
     const { rows, filled, free } = buildTimetableRows();
     insertTimetableRows(rows);
-    console.log('fixTimetableConflicts: rebuilt — filled=' + filled + ' free=' + free + ' conflicts=0');
-    return extra;
+    console.log('fixTimetableConflicts: rebuilt — filled=' + filled + ' free=' + free + ' conflicts=0 subjectFaults=0');
+    return extra + badSubject;
   } catch (e) { console.log('fixTimetableConflicts skipped: ' + e.message); return 0; }
 }
 
@@ -308,12 +395,12 @@ function teacherClasses(req) {
 // Only the teacher who has Period 1 for a class on a given day may mark
 // that class's student attendance that day. The timetable is the source
 // of truth: timetable rows are Mon–Sat, Period 1 (08:00–08:45).
-// NOTE on the seeded timetable: Period 1 is always the class's first
-// subject (English), so the English teacher of a class holds Period 1 —
-// e.g. on Wednesday 2026-11-25 Fatima Zahra holds Period 1 for 10 of 12
-// classes, Bilal Hussain for Class 5, Hassan Ali for Nursery. A Maths
-// teacher (e.g. Ahmed Raza, Period 3) therefore cannot mark attendance.
-// Admin can always mark attendance for any class.
+// NOTE on the timetable: subjects are staggered by class and day, so
+// Period 1 is a different subject (and teacher) in different classes —
+// e.g. on Monday Fatima Zahra holds Period 1 only for Nursery, Ahmed Raza
+// for Class 1, Maryam Nawaz for Class 10. Whoever holds Period 1 for a
+// class on a given day is the only teacher who can mark that class's
+// attendance that day. Admin can always mark attendance for any class.
 const TT_DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 function dayNameOf(dateStr) {
   const d = new Date(dateStr + 'T00:00:00');
@@ -468,21 +555,16 @@ function seed() {
     teacherIds.push({ id: Number(r.lastInsertRowid), subject: subj });
   });
   console.log('seed: assignments start');
-  // assignments: each teacher 5 class+subject combos = 70
+  // Assignments: ONLY the teacher's OWN subject, only in classes that
+  // actually teach it — never a different subject to fill a gap. A subject
+  // taught in few classes gives fewer assignments (e.g. Chemistry is only
+  // in Classes 9-10, so Bilal Hussain gets 2, not 5). Total = 50.
+  // Assignments are spread evenly across the eligible classes.
   const addAssign = db.prepare('INSERT OR IGNORE INTO teacher_assignments (teacher_id,class_name,subject) VALUES (?,?,?)');
-  const classForSubject = (subj) => CLASSES.filter(c => subjectsForClass(c).includes(subj));
-  teacherIds.forEach((t, ti) => {
-    // 5 UNIQUE (class, subject) assignments per teacher = 70 total.
-    // Prefer the teacher's own subject when that class teaches it.
-    let made = 0, idx = ti;
-    while (made < 5 && idx < ti + 60) {
-      const cls = CLASSES[idx % CLASSES.length];
-      const subs = subjectsForClass(cls);
-      const subj = subs.includes(t.subject) ? t.subject : subs[idx % subs.length];
-      const r = addAssign.run(t.id, cls, subj);
-      if (r.changes) made++;
-      idx++;
-    }
+  teacherIds.forEach((t) => {
+    const eligible = CLASSES.filter(c => subjectsForClass(c).includes(t.subject));
+    const n = Math.min(5, eligible.length);
+    for (let i = 0; i < n; i++) addAssign.run(t.id, eligible[Math.floor(i * eligible.length / n)], t.subject);
   });
   console.log('seed: staff attendance start');
   // staff attendance 24-25 Nov 2026 (28 rows)
@@ -549,6 +631,7 @@ ensureTeacherColumns();
 ensureResultsClassColumn();
 ensureStudentBFormColumn();
 ensureRoleAccounts();
+cleanTeacherAssignments();
 fixTimetableConflicts();
 
 // ---------- app ----------
@@ -897,12 +980,14 @@ app.get('/api/teachers', requireAuth, (req, res) => {
 app.post('/api/teachers', requireAdmin, (req, res) => {
   const b = req.body || {};
   if (!b.name) return res.status(400).json({ error: 'Name required' });
-  // Assignments may come as an array [{class_name, subject}] — derive the
-  // teacher's subjects list from them; fall back to the plain subjects string.
-  const assignments = Array.isArray(b.assignments) ? b.assignments.filter(a => a && a.class_name && a.subject) : [];
-  const subjects = assignments.length
-    ? [...new Set(assignments.map(a => a.subject))].join(', ')
-    : (b.subjects || '');
+  // Assignments may come as an array [{class_name, subject}]. One teacher =
+  // one subject: the teacher's subject is the FIRST assignment subject (or
+  // the plain subjects string), and only assignments in that subject are
+  // kept — a second subject in the draft is dropped, never saved.
+  const allAssignments = Array.isArray(b.assignments) ? b.assignments.filter(a => a && a.class_name && a.subject) : [];
+  const primary = allAssignments.length ? allAssignments[0].subject : ((b.subjects || '').split(',')[0].trim() || '');
+  const assignments = allAssignments.filter(a => a.subject === primary);
+  const subjects = primary;
   const r = db.prepare('INSERT INTO teachers (name,father_name,cnic,dob,email,address,experience,joining_date,designation,qualification,salary,phone,subjects) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
     .run(b.name, b.father_name || '', b.cnic || '', b.dob || '', b.email || '', b.address || '', b.experience || '', b.joining_date || '', b.designation || '', b.qualification || '', b.salary || 0, b.phone || '', subjects);
   const teacherId = Number(r.lastInsertRowid);
@@ -929,11 +1014,15 @@ app.put('/api/teachers/:id', requireAdmin, (req, res) => {
   db.prepare('UPDATE teachers SET name=?,father_name=?,cnic=?,dob=?,email=?,address=?,experience=?,joining_date=?,designation=?,qualification=?,salary=?,phone=?,subjects=? WHERE id=?')
     .run(b.name, b.father_name || '', b.cnic || '', b.dob || '', b.email || '', b.address || '', b.experience || '', b.joining_date || '', b.designation || '', b.qualification || '', b.salary || 0, b.phone || '', b.subjects || t.subjects || '', req.params.id);
   // If assignments were sent, replace them (so edits can change classes/subjects).
+  // One teacher = one subject: the first assignment subject becomes the
+  // teacher's subject; assignments in any other subject are dropped.
   if (Array.isArray(b.assignments)) {
     db.prepare('DELETE FROM teacher_assignments WHERE teacher_id=?').run(req.params.id);
+    const clean = b.assignments.filter(a => a && a.class_name && a.subject);
+    const primary = clean.length ? clean[0].subject : null;
     const ins = db.prepare('INSERT OR IGNORE INTO teacher_assignments (teacher_id,class_name,subject) VALUES (?,?,?)');
-    const subs = [...new Set(b.assignments.filter(a => a && a.class_name && a.subject).map(a => { ins.run(req.params.id, a.class_name, a.subject); return a.subject; }))];
-    if (subs.length) db.prepare('UPDATE teachers SET subjects=? WHERE id=?').run(subs.join(', '), req.params.id);
+    for (const a of clean.filter(a => a.subject === primary)) ins.run(req.params.id, a.class_name, a.subject);
+    if (primary) db.prepare('UPDATE teachers SET subjects=? WHERE id=?').run(primary, req.params.id);
   }
   res.json({ ok: true });
 });
@@ -948,6 +1037,12 @@ app.get('/api/teachers/:id', requireAuth, (req, res) => {
 });
 app.post('/api/teachers/:id/assignments', requireAdmin, (req, res) => {
   const b = req.body || {};
+  // One teacher = one subject: an assignment in a different subject is refused.
+  const t = db.prepare('SELECT * FROM teachers WHERE id=?').get(req.params.id);
+  if (!t) return res.status(404).json({ error: 'Teacher not found' });
+  const primary = primarySubjectOf(t);
+  if (primary && b.subject !== primary) return res.status(400).json({ error: t.name + ' sirf ' + primary + ' parhate hain — ' + b.subject + ' ki assignment nahi di ja sakti.' });
+  if (!primary && b.subject) db.prepare('UPDATE teachers SET subjects=? WHERE id=?').run(b.subject, req.params.id);
   db.prepare('INSERT OR IGNORE INTO teacher_assignments (teacher_id,class_name,subject) VALUES (?,?,?)').run(req.params.id, b.class_name, b.subject);
   res.json({ ok: true });
 });
@@ -1026,8 +1121,10 @@ app.post('/api/timetable/regenerate', requireAdmin, (req, res) => {
 // Which teachers are available for one Day+Period slot (admin only).
 // A teacher already teaching another class at that Day+Period is listed
 // as booked (with that class) — the UI must NOT offer them as a choice.
+// With ?subject=, a teacher is only "qualified" for that subject if it is
+// their own subject — the UI must NOT offer a teacher of another subject.
 app.get('/api/timetable/available', requireAdmin, (req, res) => {
-  const { day, period, class: cls } = req.query;
+  const { day, period, class: cls, subject } = req.query;
   if (!TT_DAYS.includes(day) || !period || Number(period) < 1 || Number(period) > 6) return res.status(400).json({ error: 'Day aur Period (1-6) sahi dein.' });
   const teachers = db.prepare('SELECT id, name, subjects FROM teachers ORDER BY name').all();
   const booked = db.prepare('SELECT teacher_id, class_name FROM timetable WHERE day=? AND period=? AND teacher_id IS NOT NULL').all(day, Number(period));
@@ -1036,6 +1133,7 @@ app.get('/api/timetable/available', requireAdmin, (req, res) => {
     id: t.id, name: t.name, subjects: t.subjects,
     available: !bookedById.has(t.id) || (cls && bookedById.get(t.id) === cls),
     bookedClass: bookedById.get(t.id) || null,
+    qualified: !subject || subject === 'Free' || primarySubjectOf(t) === subject,
   })));
 });
 // Edit / create a single timetable period (admin only). A teacher who is
@@ -1052,12 +1150,17 @@ app.post('/api/timetable/period', requireAdmin, (req, res) => {
   if (subject !== 'Free' && !subjectsForClass(cls).includes(subject)) return res.status(400).json({ error: 'Subject is class ke liye sahi nahi hai.' });
   if (subject === 'Free' && teacherId) return res.status(400).json({ error: 'Free period mein teacher nahi ho sakta.' });
   if (teacherId) {
-    const teacher = db.prepare('SELECT id, name FROM teachers WHERE id=?').get(teacherId);
+    const teacher = db.prepare('SELECT id, name, subjects FROM teachers WHERE id=?').get(teacherId);
     if (!teacher) return res.status(400).json({ error: 'Teacher nahi mila.' });
+    // One teacher = one subject: a teacher may only be given a period of
+    // their own subject — never another subject to fill a gap.
+    if (primarySubjectOf(teacher) !== subject) return res.status(400).json({ error: teacher.name + ' sirf ' + (primarySubjectOf(teacher) || 'koi subject nahi') + ' parhate hain — ' + subject + ' ki period un ko nahi di ja sakti.' });
     const clash = db.prepare('SELECT class_name, subject FROM timetable WHERE day=? AND period=? AND teacher_id=? AND class_name<>?').get(day, period, teacherId, cls);
     if (clash) return res.status(400).json({ error: teacher.name + ' us waqt pehle se Class ' + clash.class_name + ' mein ' + clash.subject + ' parha rahe hain (' + day + ', Period ' + period + ') — ek teacher ek hi waqt par do classes mein nahi ho sakta.' });
-    const assigned = db.prepare('SELECT 1 FROM teacher_assignments WHERE teacher_id=? AND class_name=? AND subject=?').get(teacherId, cls, subject)
-      || db.prepare('SELECT 1 FROM teacher_assignments WHERE teacher_id=? AND subject=?').get(teacherId, subject);
+    // Qualified = teaches this subject (any class). The builder likewise
+    // lets a same-subject teacher cover a class they are not directly
+    // assigned to; the class itself is not the qualification.
+    const assigned = db.prepare('SELECT 1 FROM teacher_assignments WHERE teacher_id=? AND subject=?').get(teacherId, subject);
     if (!assigned) return res.status(400).json({ error: teacher.name + ' ko ' + subject + ' ki assignment nahi hai — pehle teacher ki assignments mein ' + subject + ' add karein.' });
   }
   const times = TT_TIMES[period - 1];
