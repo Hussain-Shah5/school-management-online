@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>School Management System — Online</title><link rel="stylesheet" href="style.css"></head>
+<body>
+<div id="loginView" class="login-wrap">
+  <h2>🏫 School Management System</h2>
+  <p>School login — apna account banaein ya demo login use karein.</p>
+  <div class="demo-box"><b>Demo login:</b><br>Username: <code>admin</code><br>Password: <code>admin123</code></div>
+  <label>School name (register ke liye)</label><input id="schoolName" placeholder="Demo School">
+  <label>Username</label><input id="username" value="admin" autocomplete="username">
+  <label>Password</label><input id="password" type="password" value="admin123" autocomplete="current-password">
+  <div style="display:flex;gap:8px;margin-top:14px"><button id="loginBtn" style="flex:1">Login</button><button id="registerBtn" class="secondary" style="flex:1">Create Account</button></div>
+  <p id="loginMsg" style="color:#b91c1c"></p>
+  <p style="font-size:13px;color:#64748b">Data server-side SQLite database mein save hota hai — browser band karne par bhi data rehta hai.</p>
+</div>
+
+<div id="appView" class="hidden">
+<header><div><h1>🏫 <span id="schoolTitle">School Management System</span></h1><small id="userLine"></small></div>
+<div><button id="logoutBtn" class="secondary">Logout</button></div></header>
+<div class="container">
+  <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+    <label style="margin:0">Date <input type="date" id="todayInput" value="2026-11-25" style="width:auto"></label>
+    <label style="margin:0">Month <input type="month" id="monthInput" value="2026-11" style="width:auto"></label>
+    <button id="refreshBtn" class="secondary">Refresh</button>
+  </div>
+  <div class="cards" id="dashCards"></div>
+  <div class="tabs" id="tabs"></div>
+  <div id="view"></div>
+</div>
+</div>
+<div id="modal" class="modal hidden"><div id="modalBody"></div></div>
+<script src="app.js"></script>
+</body></html>
