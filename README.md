@@ -172,14 +172,31 @@ all data is saved on the server in `data/school.db` via the Express API.
 - **Timetable rule (no double-booking):** a teacher can teach at most ONE class
   in the same Day + Period slot. Subjects are staggered by class so different
   classes need different subjects at the same time; if the teacher for a
-  class+subject is already booked then, the next available teacher for that
-  subject is used, otherwise that period is left **Free**. The old timetable
-  booked e.g. the only English teacher in 10 classes at 08:00 — that can no
-  longer happen. On startup, any existing double-booked timetable is rebuilt
+  class+subject is already booked then, that period is left **Free** — a
+  second teacher of the same subject may NOT cover the class (see the
+  one-teacher-per-class+subject rule below). The old timetable booked e.g.
+  the only English teacher in 10 classes at 08:00 — that can no longer
+  happen. On startup, any existing double-booked timetable is rebuilt
   conflict-free. In the Timetable tab, admin can **Edit a period**: the teacher
   dropdown only offers teachers free at that Day + Period (booked teachers are
   shown disabled, with the class they are already teaching); the server also
   refuses a booked teacher with a clear error.
+- **Timetable rule (one teacher per class+subject):** once a class+subject is
+  assigned to one teacher, it can NOT be assigned to another teacher — e.g.
+  Class 1 Maths was assigned to both Ahmed Raza and Amna Tariq (and Classes
+  2, 3, KG the same). Now the server refuses such an assignment with a clear
+  error naming the holder (“Class 1 ka Maths pehle se Ahmed Raza ko assign
+  hai”), the assignment picker disables it (holder's name shown), and the
+  timetable builder only ever gives a period to its assigned holder. On
+  startup, duplicate assignments are removed (4 removed in the shipped
+  seed) and the removed teacher is given the first still-unheld class for
+  that subject instead (Amna Tariq: Classes 1/2/3/KG → 4/5/6/7/8), so no
+  teacher loses assignments; a UNIQUE(class_name, subject) index also
+  blocks duplicates in the database itself. A date-only substitute is NOT
+  a permanent assignment and is still allowed. Result: 288 of 432 periods
+  filled, 144 Free — the drop from 336 is because a class+subject period
+  can now only be taught by its one holder, never by the second teacher of
+  the same subject.
 - **Timetable rule (one teacher = one subject):** a teacher teaches exactly
   ONE subject in every class (Ahmed Raza only Maths, Fatima Zahra only
   English, …). The old seed gave teachers assignments in subjects that are
@@ -193,11 +210,12 @@ all data is saved on the server in `data/school.db` via the Express API.
   subject is free, the period is left **Free** rather than giving it to a
   teacher of another subject. Edit-a-period only offers free teachers
   qualified for the chosen subject (others are shown disabled, e.g. “sirf
-  Maths parhate hain”). Result: 336 of 432 periods filled, 96 Free — the
-  Free periods are exactly the supply shortfall (English and Urdu each
-  need 72 slots/week but have 1 teacher = 36; Science and Islamiat each
-  need 48 but have 1 teacher = 36), so they are honest, not a bug. A
-  teacher of a second subject can only be added as a new teacher.
+  Maths parhate hain”). Result: 288 of 432 periods filled, 144 Free — the
+  Free periods are the supply shortfall plus holder collisions (a
+  class+subject period can only be taught by its one assigned holder, so
+  when that holder is booked in another of their classes the period stays
+  Free), so they are honest, not a bug. A teacher of a second subject can
+  only be added as a new teacher.
 
 ## Demo logins (seeded on first run / on startup)
 
@@ -304,7 +322,7 @@ inside Students / Fees / Results / Attendance.
 - **Mid Term 2026 results** for every student (6 subjects each).
 - **Fees Oct + Nov 2026** for every student. November totals are exact:
   total **Rs 508,100**, collected **Rs 317,150**, pending **Rs 190,950**.
-- **14 teachers**, 70 class/subject assignments, staff attendance 24–25 Nov 2026.
+- **14 teachers**, 50 class/subject assignments (one teacher per class+subject — the old 70 included 33 wrong-subject and 4 duplicate assignments, cleaned on startup), staff attendance 24–25 Nov 2026.
 - **8 leaving records**, **224 promotions**, attendance 24–25 Nov 2026
   (25 Nov: 230 present out of 241 active students).
 - **432 timetable periods** (12 classes × 6 days × 6 periods).
