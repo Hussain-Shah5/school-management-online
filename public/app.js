@@ -679,7 +679,16 @@ async function loadTimetable() {
   <div style="flex:1;min-width:220px"><label style="margin:0 0 4px">Search timetable (subject / teacher naam)</label><input id="ttSearch" placeholder="e.g. Maths, Ahmed Raza" value="${esc(window._ttSearch || '')}"></div>
   <button id="ttGo">Search</button><button id="ttClear" class="secondary">Clear</button></div>
   <div id="ttMatches"></div>
-  ${timetableGridHTML(rows, { showClass: me.role === 'teacher', showTeacher: isAdmin })}</div>`;
+  ${timetableGridHTML(rows, { showClass: me.role === 'teacher', showTeacher: isAdmin })}
+  ${isAdmin ? `<div class="card" style="margin-top:14px"><h3 style="margin-top:0">Edit a period (Admin)</h3>
+  <p style="font-size:13px;color:var(--muted)">Ek teacher ek hi waqt par sirf ek class mein ho sakta hai — jo teacher us Day + Period mein kisi aur class mein pehle se booked hai, wo is list mein <b>nahi</b> aayega (ya disabled dikhega, wajah ke saath). Koi teacher free nahi to period ko <b>Free</b> rakhein.</p>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end">
+  <div><label style="margin:0 0 4px">Day</label><select id="epDay" style="max-width:130px">${TT_DAYS.map(d=>`<option>${d}</option>`).join('')}</select></div>
+  <div><label style="margin:0 0 4px">Period</label><select id="epPeriod" style="max-width:100px">${[1,2,3,4,5,6].map(p=>`<option value="${p}">Period ${p}</option>`).join('')}</select></div>
+  <div><label style="margin:0 0 4px">Subject</label><select id="epSubject" style="max-width:160px"></select></div>
+  <div style="flex:1;min-width:200px"><label style="margin:0 0 4px">Teacher (sirf free teachers)</label><select id="epTeacher"></select></div>
+  <button id="epSave">Save Period</button></div>
+  <p id="epMsg" style="font-size:13px"></p></div>` : ''}</div>`;
   const ttDoSearch = () => {
     const q = ($('#ttSearch').value || '').trim().toLowerCase();
     window._ttSearch = $('#ttSearch').value || '';
@@ -700,7 +709,32 @@ async function loadTimetable() {
   if (window._ttSearch) ttDoSearch();
   if (isAdmin) {
     $('#tClass').onchange = e => { stuFilter.class = e.target.value; loadTimetable(); };
-    $('#regen').onclick = async () => { await api('/api/timetable/regenerate', { method: 'POST' }); loadTimetable(); };
+    $('#regen').onclick = async () => { const r = await api('/api/timetable/regenerate', { method: 'POST' }); alert('Timetable regenerate ho gaya — filled: ' + r.filled + ', Free: ' + r.free + ', conflicts: ' + r.conflicts); loadTimetable(); };
+    // Edit-a-period: teacher dropdown only offers teachers free at that Day+Period.
+    const fillSubjects = () => { $('#epSubject').innerHTML = subjectsForClass(cls).map(s => `<option>${s}</option>`).join('') + '<option>Free</option>'; };
+    const fillTeachers = async () => {
+      const day = $('#epDay').value, period = $('#epPeriod').value;
+      let list = [];
+      try { list = await api('/api/timetable/available?day=' + encodeURIComponent(day) + '&period=' + period + '&class=' + encodeURIComponent(cls)); } catch (e) { $('#epMsg').textContent = e.message; return; }
+      const subj = $('#epSubject').value;
+      const free = list.filter(t => t.available);
+      const booked = list.filter(t => !t.available);
+      $('#epTeacher').innerHTML = '<option value="">— Free (koi teacher nahi) —</option>'
+        + free.map(t => `<option value="${t.id}">${esc(t.name)} (${esc(t.subjects || '')})</option>`).join('')
+        + booked.map(t => `<option value="${t.id}" disabled>${esc(t.name)} — busy: Class ${esc(t.bookedClass || '')} mein pehle se booked</option>`).join('');
+      $('#epMsg').textContent = subj === 'Free' ? 'Free period — teacher select na karein.' : (free.length ? free.length + ' teacher(s) free hain is waqt.' : 'Is waqt koi teacher free nahi hai — period Free rakhein.');
+    };
+    fillSubjects();
+    $('#epDay').onchange = fillTeachers; $('#epPeriod').onchange = fillTeachers; $('#epSubject').onchange = fillTeachers;
+    fillTeachers();
+    $('#epSave').onclick = async () => {
+      try {
+        const subject = $('#epSubject').value;
+        await api('/api/timetable/period', { method: 'POST', body: JSON.stringify({ class_name: cls, day: $('#epDay').value, period: Number($('#epPeriod').value), subject, teacher_id: subject === 'Free' || !$('#epTeacher').value ? null : Number($('#epTeacher').value) }) });
+        $('#epMsg').textContent = 'Period save ho gaya.';
+        loadTimetable();
+      } catch (e) { $('#epMsg').textContent = e.message; }
+    };
   }
 }
 
