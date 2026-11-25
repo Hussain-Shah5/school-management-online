@@ -222,6 +222,22 @@ async function checkLogin() {
   $('#loginView').classList.toggle('hidden', !!me.loggedIn);
   $('#appView').classList.toggle('hidden', !me.loggedIn);
   if (me.loggedIn) {
+    // PARENT FIRST-VIEW LEAK — FIXED HERE. The old code left the previous
+    // session's view on screen: after an admin viewed the Students tab
+    // (full 250-student list) and logged out, the #view HTML stayed in
+    // the DOM; a parent logging in afterwards (same browser tab, no
+    // reload) saw that full list until the async dashboard fetch came
+    // back, because `tab` also survived the login ('students' is a valid
+    // parent tab, so it was never reset). So on EVERY login: force the
+    // landing tab to Dashboard, drop every cached list from the previous
+    // role/session, and blank the view + cards to a loading state BEFORE
+    // any fetch runs — nothing from another role is ever painted again.
+    tab = 'dashboard';
+    studentsCache = []; teachersCache = []; myClasses = [];
+    stuFilter = { class: '', search: '', mode: 'name', roll: '' };
+    window._myChildIds = [];
+    const _v = $('#view'); if (_v) _v.innerHTML = '<div class="card"><p>Loading…</p></div>';
+    const _dc = $('#dashCards'); if (_dc) _dc.innerHTML = '';
     // Server-saved language wins when this browser has no saved choice yet.
     try {
       if (!localStorage.getItem('sms-lang') && me.language && me.language !== lang) {
@@ -253,7 +269,16 @@ $('#registerBtn').onclick = async () => {
     $('#loginMsg').textContent = ''; checkLogin();
   } catch (e) { $('#loginMsg').textContent = e.message; }
 };
-$('#logoutBtn').onclick = async () => { await api('/api/logout', { method: 'POST' }); checkLogin(); };
+$('#logoutBtn').onclick = async () => {
+  await api('/api/logout', { method: 'POST' });
+  // Same leak guard as on login: drop every cached list and blank the
+  // view, so the next login (any role) never inherits this session's data.
+  me = null; tab = 'dashboard'; studentsCache = []; teachersCache = []; myClasses = [];
+  window._myChildIds = [];
+  const _v = $('#view'); if (_v) _v.innerHTML = '';
+  const _dc = $('#dashCards'); if (_dc) _dc.innerHTML = '';
+  checkLogin();
+};
 const notifBellBtn = $('#notifBell');
 if (notifBellBtn) notifBellBtn.onclick = () => { tab = 'notifications'; renderTabs(); loadTab('notifications'); window.scrollTo({ top: 0, behavior: 'smooth' }); };
 // Dashboard cards are live data, not a snapshot: refresh them whenever
@@ -372,6 +397,11 @@ async function loadDashboard() {
   }
   if (d.role === 'parent') {
     const c = d.child;
+    // Remember this parent's linked child ids (server-scoped dashboard
+    // data) — the Students tab uses them as a second, client-side filter,
+    // so a parent can never render another student's row even if a stale
+    // cache or a bad response ever carried one.
+    window._myChildIds = [...new Set([...(d.children || []).map(x => x.id), d.child ? d.child.id : null].filter(Boolean))];
     $('#dashCards').innerHTML = [
       [esc(c.name), t('cardMyChild')], ['Class ' + esc(c.class_name) + '-' + esc(c.section), t('cardClass') + ' (Roll ' + esc(c.roll_no) + ')'],
       [d.attPct + '%', t('cardAttendance')], ['Rs ' + d.feesPaid.toLocaleString(), t('cardFeesPaid')], ['Rs ' + d.feesPending.toLocaleString(), t('cardFeesPending')],
@@ -408,10 +438,20 @@ async function loadDashboard() {
 let stuFilter = { class: '', search: '', mode: 'name', roll: '' };
 async function loadStudents() {
   if (stuFilter.mode === 'classroll' && !stuFilter.class) stuFilter.class = '1'; // Class + Roll search needs a class — default Class 1
+  // Never paint a stale list while the new one loads: blank the view
+  // first (a previous role's list must not sit on screen during the fetch).
+  $('#view').innerHTML = '<div class="card"><p>Loading…</p></div>';
   const params = { mode: stuFilter.mode || 'name' };
   if (stuFilter.mode === 'classroll') { params.class = stuFilter.class; params.roll = stuFilter.roll; }
   else { params.class = stuFilter.class; params.search = stuFilter.search; }
   studentsCache = await api('/api/students?' + new URLSearchParams(params));
+  // Parent second layer (the server already scopes /api/students to the
+  // parent's linked children): drop any row that is not one of this
+  // parent's linked children, so the My Child list can never show
+  // another student — not even one row, not even briefly.
+  if (me.role === 'parent' && window._myChildIds && window._myChildIds.length) {
+    studentsCache = studentsCache.filter(s => window._myChildIds.includes(s.id));
+  }
   const isAdmin = me.role === 'admin';
   const mode = stuFilter.mode || 'name';
   const searchPh = mode === 'bform' ? 'B-Form No. likhein — e.g. 35202-1234567-1' : mode === 'classroll' ? 'Roll No. likhein — e.g. 01' : 'Naam likhein — e.g. Sara, Noor Ali';
@@ -430,7 +470,7 @@ async function loadStudents() {
     <button id="fGo">Search</button><button id="fClear" class="secondary">Clear</button>${isAdmin ? '<button id="addStu">+ Add Student</button><button id="expStu" class="secondary">Export Students CSV</button>' : ''}</div>
     <p>${studentsCache.length === 0 ? 'Koi student nahi mila — search ya class dobara check karein.' : studentsCache.length + ' student(s) found — Profile button se poori profile kholein.'}</p>
     <div style="overflow-x:auto"><table><tr><th>Roll</th><th>Name</th><th>Father</th><th>Class</th><th>B-Form No</th><th>Phone</th><th>Monthly Fee</th><th>Status</th><th></th></tr>
-    ${studentsCache.map(s => `<tr><td>${esc(s.roll_no)}</td><td>${esc(s.name)}</td><td>${esc(s.father_name)}</td><td>${esc(s.class_name)}-${esc(s.section)}</td><td>${esc(s.b_form_no || '—')}</td><td>${esc(s.phone)}</td><td>Rs ${s.monthly_fee}</td><td><span class="badge ${s.status==='left'?'left':''}">${s.status}</span></td><td><button class="secondary" onclick="viewStudent(${s.id})">Profile</button></td></tr>`).join('')}</table></div></div>`;
+    ${studentsCache.map(s => `<tr><td>${esc(s.roll_no)}</td><td>${esc(s.name)}</td><td>${esc(s.father_name)}</td><td>${esc(s.class_name)}-${esc(s.section)}</td><td>${esc(s.b_form_no || '—')}</td><td>${esc(s.phone)}</td><td>Rs ${s.monthly_fee}</td><td><span class="badge ${s.status==='left'?'left':''}">${s.status}</span></td><td><button class="secondary" onclick="viewStudent(${s.id})">Profile</button>${isAdmin ? ` <button class="danger" onclick="deleteStudent(${s.id})">Delete</button>` : ''}</td></tr>`).join('')}</table></div></div>`;
   const doSearch = () => {
     stuFilter.mode = $('#fMode').value;
     stuFilter.class = $('#fClass').value;
@@ -583,7 +623,8 @@ window.viewStudent = async (id) => {
   <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
   ${isAdmin ? `<button onclick="closeModal();studentForm(window._curStudent)">Edit</button>
   <button class="secondary" onclick="leaveStudent(${s.id})">Mark as Left School</button>
-  <button class="secondary" onclick="promoteStudent(${s.id})">Promote</button>` : ''}
+  <button class="secondary" onclick="promoteStudent(${s.id})">Promote</button>
+  <button class="danger" onclick="deleteStudent(${s.id})">Delete Student</button>` : ''}
   <button class="secondary" onclick="closeModal()">Close</button>
   <button onclick="window.print()">Print Result Card</button></div>`);
 };
@@ -630,6 +671,33 @@ window.promoteStudent = async (id) => {
   const to = prompt('Promote to class? (Nursery/KG/1..10)', ''); if (!to) return;
   await api(`/api/students/${id}/promote`, { method: 'POST', body: JSON.stringify({ to_class: to, exam: 'Annual Exam', percentage: 75 }) });
   closeModal(); loadStudents();
+};
+// ---- Delete Student (admin only, with confirmation) ----
+// Deletes the student AND everything that belongs to them — attendance,
+// fees, results, promotions, leaving record and notifications. The linked
+// parent login is deleted too, but ONLY if no other child is linked to
+// that parent login (siblings keep their login). Two steps on purpose:
+// a confirm panel naming the student and what will go, then the actual
+// DELETE call — there is no undo after this.
+window.deleteStudent = async (id) => {
+  let s;
+  try { s = await api('/api/students/' + id); } catch (e) { alert(e.message); return; }
+  openModal(`<h3 style="color:#b91c1c">Delete Student — ${esc(s.name)}?</h3>
+  <p>Class ${esc(s.class_name)}-${esc(s.section)} • Roll ${esc(s.roll_no)} • Father: ${esc(s.father_name)}</p>
+  <p><b>Ye hamesha ke liye delete ho jayega, wapas nahi aayega:</b> student ka record, attendance, fees, results, promotions, leaving record aur notifications.</p>
+  <p>Is student ka parent login bhi delete ho jayega — <b>sirf tab</b> jab us parent login se koi aur bacha linked nahi hai. Agar bhai/behen usi login se linked hain to parent login rehta hai.</p>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
+    <button class="danger" id="delConfirmBtn">Yes — Delete Forever</button>
+    <button class="secondary" onclick="closeModal()">Cancel</button>
+  </div>`);
+  $('#delConfirmBtn').onclick = async () => {
+    try {
+      const r = await api('/api/students/' + id, { method: 'DELETE' });
+      closeModal();
+      alert('Student delete ho gaya: ' + s.name + ' (Class ' + s.class_name + ')' + (r.parentLoginsDeleted ? ' — parent login bhi delete ho gaya (koi aur bacha linked nahi tha).' : ' — parent login reh gaya (kisi aur bachay se linked hai).'));
+      loadStudents();
+    } catch (e) { alert(e.message); }
+  };
 };
 
 // ---- Attendance ----
