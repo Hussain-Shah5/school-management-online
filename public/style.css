@@ -130,6 +130,16 @@ td small{color:var(--muted)}
 .tt-match b{color:#7c5a12}
 .tt-free{color:var(--muted);background:#fbf7ea}
 .tt-free small{color:#a8a58e}
+/* Click-to-edit cells (admin): pointer + gold hover so it is obvious the box is editable */
+.tt-clickable{cursor:pointer}
+.tt-clickable:hover{outline:2px solid var(--gold);outline-offset:-2px;background:#fdf6dd}
+/* Teacher on leave on the viewed date: amber "Free — chhuti", substitute needed */
+.tt-leave{background:var(--amber-soft);color:#92400e}
+.tt-leave small{display:block;color:#92400e;line-height:1.35}
+.tt-leave:hover{outline:2px solid #f59e0b;outline-offset:-2px}
+/* Substitute assigned for that date: green tint */
+.tt-sub{background:var(--green-soft)}
+.tt-sub small{display:block;color:var(--muted);line-height:1.35}
 .tt-break td{background:var(--gold-soft);color:#7c5a12;font-weight:700;text-align:center;border-bottom:1px solid var(--line)}
 @media(max-width:760px){.tt-table{min-width:680px}}
 

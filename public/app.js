@@ -37,24 +37,44 @@ function subjectsForClass(cls) {
 }
 const TT_DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 const TT_DAY_SHORT = { Monday: 'Mon', Tuesday: 'Tue', Wednesday: 'Wed', Thursday: 'Thu', Friday: 'Fri', Saturday: 'Sat' };
-const TT_TIMES = [['08:00', '08:45'], ['08:45', '09:30'], ['09:30', '10:15'], ['10:45', '11:30'], ['11:30', '12:15'], ['12:15', '13:00']];
-// Weekly timetable as a proper table: rows = Period 1-6 (+ Break row),
-// columns = Mon-Sat. Each cell: Subject + Class + Time. Empty = "— Free".
-// rows: [{day, period, subject, class_name, teacher_name, start_time, end_time}]
-// opts: {showClass: true/false, showTeacher: true/false}
+const TT_TIMES = [['08:00', '08:45'], ['08:45', '09:30'], ['09:30', '10:15'], ['10:45', '11:30'], ['11:30', '12:15'], ['12:15', '13:00'], ['13:00', '13:45'], ['13:45', '14:30']];
+// Current timetable settings from the server (periods per day + slot
+// times). Filled by loadTimetable(); every grid uses them so a settings
+// change shows everywhere (incl. teacher profiles).
+window._ttSettings = window._ttSettings || { periodsPerDay: 6, periodTimes: TT_TIMES.map((t, i) => ({ period: i + 1, start: t[0], end: t[1] })), breakAfter: 3 };
+// Weekly timetable as a proper table: rows = Periods (settings count) +
+// Break row, columns = Mon-Sat. Each cell: Subject + Class + Time.
+// Empty = "— Free". Admin cells are clickable (opts.clickable) — click
+// opens the edit panel for that class + day + period. A teacher on leave
+// on the viewed date shows as "Free — chhuti" (substitute needed); a
+// substitute override shows the substitute's name.
+// rows: [{day, period, subject, class_name, teacher_name, start_time, end_time, onLeave, substitute, original_teacher_name}]
+// opts: {showClass, showTeacher, clickable, periods, times}
 function timetableGridHTML(rows, opts = {}) {
   const showClass = opts.showClass !== false, showTeacher = !!opts.showTeacher;
+  const clickable = !!opts.clickable;
+  const periods = opts.periods || (window._ttSettings && window._ttSettings.periodsPerDay) || 6;
+  const times = opts.times || (window._ttSettings && window._ttSettings.periodTimes) || TT_TIMES.map((t, i) => ({ period: i + 1, start: t[0], end: t[1] }));
+  const timeOf = (p) => { const t = times[p - 1]; return t ? (t.start + '–' + t.end) : ''; };
   const cell = (day, period) => {
     const r = (rows || []).find(x => x.day === day && Number(x.period) === period);
-    if (!r) return '<td class="tt-free">—<br><small>Free</small></td>';
-    return `<td class="tt-cell"><b>${esc(r.subject)}</b>${showClass ? `<br><small>Class ${esc(r.class_name)}</small>` : ''}${showTeacher && r.teacher_name ? `<br><small>${esc(r.teacher_name)}</small>` : ''}<br><small>${esc(r.start_time || '')}${r.end_time ? '–' + esc(r.end_time) : ''}</small></td>`;
+    const click = clickable ? ` data-day="${day}" data-period="${period}" class="tt-clickable" title="Click karein — is period ko edit karein" onclick="openTtCellEdit('${day}',${period})"` : '';
+    if (!r) return `<td class="tt-free"${clickable ? click : ''}>—<br><small>Free</small></td>`;
+    if (r.onLeave) return `<td class="tt-leave"${click}><b>Free — chhuti</b><br><small>${esc(r.original_teacher_name || '')} chhuti par (${esc(r.leaveStatus || 'Leave')})</small><br><small>Substitute chunein — click karein</small><br><small>${esc(r.start_time || '')}${r.end_time ? '–' + esc(r.end_time) : ''}</small></td>`;
+    if (r.substitute) return `<td class="tt-sub"${click}><b>${esc(r.subject)}</b>${showTeacher && r.teacher_name ? `<br><small>${esc(r.teacher_name)} (substitute)</small>` : ''}${showClass ? `<br><small>Class ${esc(r.class_name)}</small>` : ''}<br><small>${esc(r.start_time || '')}${r.end_time ? '–' + esc(r.end_time) : ''}</small></td>`;
+    if (r.subject === 'Free' || !r.teacher_id) return `<td class="tt-free"${click}>—<br><small>Free</small><br><small>Click karein — teacher lagayein</small><br><small>${esc(r.start_time || '')}${r.end_time ? '–' + esc(r.end_time) : ''}</small></td>`;
+    return `<td class="tt-cell"${click}><b>${esc(r.subject)}</b>${showClass ? `<br><small>Class ${esc(r.class_name)}</small>` : ''}${showTeacher && r.teacher_name ? `<br><small>${esc(r.teacher_name)}</small>` : ''}<br><small>${esc(r.start_time || '')}${r.end_time ? '–' + esc(r.end_time) : ''}</small></td>`;
   };
-  const periodRow = (p) => `<tr><th class="tt-period">Period ${p}<br><small>${TT_TIMES[p - 1][0]}–${TT_TIMES[p - 1][1]}</small></th>${TT_DAYS.map(d => cell(d, p)).join('')}</tr>`;
+  const periodRow = (p) => `<tr><th class="tt-period">Period ${p}<br><small>${timeOf(p)}</small></th>${TT_DAYS.map(d => cell(d, p)).join('')}</tr>`;
+  const breakAfter = (window._ttSettings && window._ttSettings.breakAfter) || 3;
+  let body = '';
+  for (let p = 1; p <= periods; p++) {
+    body += periodRow(p);
+    if (p === breakAfter && periods > breakAfter) body += `<tr class="tt-break"><td><b>Break</b></td><td colspan="6">Break — ${esc(timeOf(3).split('–')[1] || '10:15')} to ${esc((times[3] || {}).start || '10:45')}</td></tr>`;
+  }
   return `<div class="tt-wrap"><table class="tt-table"><thead><tr><th class="tt-period">Period</th>${TT_DAYS.map(d => `<th>${TT_DAY_SHORT[d]}<br><small>${d}</small></th>`).join('')}</tr></thead><tbody>
-  ${periodRow(1)}${periodRow(2)}${periodRow(3)}
-  <tr class="tt-break"><td><b>Break</b></td><td colspan="6">Break — 10:15 to 10:45</td></tr>
-  ${periodRow(4)}${periodRow(5)}${periodRow(6)}
-  </tbody></table></div><p style="font-size:13px;color:var(--muted)">Periods 1–6, Monday to Saturday. Khaali khana matlab us period mein koi class nahi (Free).</p>`;
+  ${body}
+  </tbody></table></div><p style="font-size:13px;color:var(--muted)">Periods 1–${periods}, Monday to Saturday. Khaali khana matlab us period mein koi class nahi (Free).${clickable ? ' <b>Kisi bhi box par click karein — subject, teacher aur time edit ho jayega.</b>' : ''}</p>`;
 }
 
 // ---- Login / role picker ----
@@ -670,16 +690,41 @@ window.viewTeacher = async (id) => {
 async function loadTimetable() {
   const isAdmin = me.role === 'admin';
   const cls = isAdmin ? (stuFilter.class || '1') : '';
-  const rows = await api('/api/timetable' + (isAdmin ? '?class=' + cls : ''));
+  // Date for the leave / substitute view — default: toolbar date (today).
+  if (!window._ttDate) window._ttDate = $('#todayInput').value;
+  const ttDate = window._ttDate;
+  if (isAdmin) { try { window._ttSettings = await api('/api/timetable/settings'); } catch (e) { /* keep defaults */ } }
+  const settings = window._ttSettings;
+  // Full 8-slot times for the settings editor (slots beyond periods/day
+  // are stored too, so raising periods later uses them).
+  const fullTimes = TT_TIMES.map((d, i) => { const s = (settings.periodTimes || [])[i]; return s ? { period: i + 1, start: s.start, end: s.end } : { period: i + 1, start: d[0], end: d[1] }; });
+  window._ttFullTimes = fullTimes;
+  window._ttClass = cls; window._ttRows = null;
+  const q = new URLSearchParams();
+  if (isAdmin) q.set('class', cls);
+  if (isAdmin || me.role === 'parent') q.set('date', ttDate);
+  const rows = await api('/api/timetable' + (q.toString() ? '?' + q.toString() : ''));
+  window._ttRows = rows;
   const title = isAdmin ? 'Timetable — Class ' + cls : me.role === 'teacher' ? 'My Timetable' : 'Child Timetable';
   $('#view').innerHTML = `<div class="card"><h3>${title} — Periods (rows) × Days (columns)</h3>
   ${isAdmin ? `<select id="tClass" style="max-width:160px">${CLASSES.map(c=>`<option ${c===cls?'selected':''}>${c}</option>`).join('')}</select>
   <button id="regen" class="secondary">Regenerate from teacher assignments</button>` : ''}
   <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin:10px 0">
+  <div><label style="margin:0 0 4px">Date (chhuti / substitute dekhne ke liye)</label><input type="date" id="ttDate" value="${ttDate}" style="max-width:170px"></div>
+  <span style="font-size:13px;color:var(--muted);align-self:center">Is date ko jo teacher Leave/Absent hai, us ki periods “Free — chhuti” dikhengi — box par click karke substitute lagayein.</span></div>
+  ${isAdmin ? `<div class="card" style="margin:10px 0"><h3 style="margin-top:0">Timetable Settings (Admin)</h3>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end">
+  <div><label style="margin:0 0 4px">Periods per day</label><select id="ttPeriods" style="max-width:110px">${[4,5,6,7,8].map(n=>`<option value="${n}" ${n===settings.periodsPerDay?'selected':''}>${n} periods</option>`).join('')}</select></div>
+  <button id="ttSaveSettings">Save Settings</button><span id="ttSettingsMsg" style="font-size:13px"></span></div>
+  <p style="font-size:13px;color:var(--muted)">Periods badalne par grid foran badal jata hai — zyada periods Free add hote hain, kam karne par aakhri periods hat jate hain. Neeche har period ka time bhi badal sakte hain — time poore hafte ki us period ke liye badalta hai.</p>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px">
+  ${fullTimes.map(t=>`<div><label style="margin:0 0 4px">Period ${t.period}${t.period > settings.periodsPerDay ? ' (abhi off)' : ''}</label><div style="display:flex;gap:4px"><input type="time" data-pt="${t.period}" data-k="start" value="${t.start}"><input type="time" data-pt="${t.period}" data-k="end" value="${t.end}"></div></div>`).join('')}
+  </div></div>` : ''}
+  <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin:10px 0">
   <div style="flex:1;min-width:220px"><label style="margin:0 0 4px">Search timetable (subject / teacher naam)</label><input id="ttSearch" placeholder="e.g. Maths, Ahmed Raza" value="${esc(window._ttSearch || '')}"></div>
   <button id="ttGo">Search</button><button id="ttClear" class="secondary">Clear</button></div>
   <div id="ttMatches"></div>
-  ${timetableGridHTML(rows, { showClass: me.role === 'teacher', showTeacher: isAdmin })}
+  ${timetableGridHTML(rows, { showClass: me.role === 'teacher', showTeacher: isAdmin, clickable: isAdmin })}
   ${isAdmin ? `<div class="card" style="margin-top:14px"><h3 style="margin-top:0">Edit a period (Admin)</h3>
   <p style="font-size:13px;color:var(--muted)">Ek teacher ek hi waqt par sirf ek class mein ho sakta hai — jo teacher us Day + Period mein kisi aur class mein pehle se booked hai, wo is list mein <b>nahi</b> aayega (ya disabled dikhega, wajah ke saath). Sirf usi subject ke teacher dikhte hain jo subject aap ne chuna hai — dusre subject ka teacher kabhi offer nahi hota. Koi teacher free nahi to period ko <b>Free</b> rakhein.</p>
   <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end">
@@ -707,9 +752,25 @@ async function loadTimetable() {
   $('#ttSearch').onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); ttDoSearch(); } };
   $('#ttClear').onclick = () => { window._ttSearch = ''; loadTimetable(); };
   if (window._ttSearch) ttDoSearch();
+  const ttDateEl = $('#ttDate'); if (ttDateEl) ttDateEl.onchange = e => { window._ttDate = e.target.value; loadTimetable(); };
   if (isAdmin) {
     $('#tClass').onchange = e => { stuFilter.class = e.target.value; loadTimetable(); };
     $('#regen').onclick = async () => { const r = await api('/api/timetable/regenerate', { method: 'POST' }); alert('Timetable regenerate ho gaya — filled: ' + r.filled + ', Free: ' + r.free + ', conflicts: ' + r.conflicts); loadTimetable(); };
+    // Settings: periods per day + slot times (server-side, persists).
+    const saveBtn = $('#ttSaveSettings');
+    if (saveBtn) saveBtn.onclick = async () => {
+      try {
+        const periodTimes = [];
+        for (let p = 1; p <= 8; p++) {
+          const s = document.querySelector(`input[data-pt="${p}"][data-k="start"]`).value;
+          const e = document.querySelector(`input[data-pt="${p}"][data-k="end"]`).value;
+          periodTimes.push([s, e]);
+        }
+        const r = await api('/api/timetable/settings', { method: 'POST', body: JSON.stringify({ periodsPerDay: Number($('#ttPeriods').value), periodTimes }) });
+        $('#ttSettingsMsg').textContent = 'Settings save ho gayi — ' + r.settings.periodsPerDay + ' periods/day, filled ' + r.filled + ', Free ' + r.free + '.';
+        loadTimetable();
+      } catch (e) { const m = $('#ttSettingsMsg'); if (m) m.textContent = e.message; else alert(e.message); }
+    };
     // Edit-a-period: teacher dropdown only offers teachers free at that Day+Period
     // AND qualified for the chosen subject (one teacher = one subject — a
     // teacher of another subject is never offered, even if free).
@@ -741,6 +802,97 @@ async function loadTimetable() {
     };
   }
 }
+
+// ---- Click-to-edit a timetable period (admin only) ----
+// Admin kisi bhi period ke box par click kare — bhara hua ho ya Free —
+// to is panel mein us class + day + period ka subject, teacher aur time
+// apni marzi se set kar sakta hai. Teacher dropdown mein SIRF wohi
+// teachers aate hain jo us Day+Period mein koi class nahi parha rahe
+// (free) AUR us subject ke hon — busy ya galat-subject wale list mein
+// aate hi nahi. Server save par dobara check karta hai (qualified +
+// free + no double-booking), warna Roman Urdu error deta hai.
+// Chhuti wala case: agar is date ko original teacher Leave/Absent hai,
+// to Save sirf us DATE ke liye substitute lagata hai (weekly timetable
+// nahi badalta) — aur substitute Period 1 ka ho to wohi us din ki
+// attendance bhi laga sakta hai.
+window.openTtCellEdit = async (day, period) => {
+  if (me.role !== 'admin') return;
+  const cls = window._ttClass || stuFilter.class || '1';
+  const date = window._ttDate || $('#todayInput').value;
+  const rows = window._ttRows || [];
+  const row = rows.find(r => r.day === day && Number(r.period) === period) || { day, period, subject: 'Free', teacher_id: null, teacher_name: null, start_time: '', end_time: '' };
+  const isLeave = !!row.onLeave;
+  const hasSub = !!row.substitute;
+  const subs = subjectsForClass(cls);
+  // Leave cell: the effective row shows subject 'Free', but the real
+  // subject is original_subject — the substitute must teach THAT subject.
+  const rowSubject = row.onLeave ? (row.original_subject || row.subject) : row.subject;
+  const curTime = (window._ttSettings && window._ttSettings.periodTimes && window._ttSettings.periodTimes[period - 1]) || { start: row.start_time || '08:00', end: row.end_time || '08:45' };
+  openModal(`<h3>Edit Period — Class ${esc(cls)}, ${esc(day)}, Period ${period}</h3>
+  ${isLeave ? `<div style="background:#fef3c7;border:1px solid #f59e0b;border-radius:10px;padding:10px;margin-bottom:10px">⚠️ <b>${esc(row.original_teacher_name || '')} ${date} ko chhuti par hain (${esc(row.leaveStatus || 'Leave')})</b> — ye period is date ke liye Free hai. Neeche se substitute chunein — substitute <b>sirf ${date}</b> ke liye lagega, weekly timetable nahi badlega. Substitute Period 1 ka ho to wohi us din ki attendance bhi laga sakta hai.</div>` : ''}
+  ${hasSub ? `<div style="background:#dcfce7;border:1px solid #16a34a;border-radius:10px;padding:10px;margin-bottom:10px">✅ Is date ke liye substitute laga hua hai: <b>${esc(row.teacher_name || '')}</b> (${esc(row.subject)}). “Clear Substitute” se hata sakte hain.</div>` : ''}
+  ${!isLeave && row.subject !== 'Free' ? `<p style="font-size:13px;color:var(--muted)">Abhi: <b>${esc(row.subject)}</b> — ${esc(row.teacher_name || '—')} (${esc(row.start_time || '')}–${esc(row.end_time || '')})</p>` : ''}
+  <label>Subject (is class ka)${isLeave ? ' — original subject: ' + esc(rowSubject) : ''}</label><select id="ceSubject">${subs.map(s => `<option ${s === rowSubject ? 'selected' : ''}>${s}</option>`).join('')}<option ${rowSubject === 'Free' ? 'selected' : ''}>Free</option></select>
+  <label>Teacher — sirf free teachers (is waqt koi class nahi parha rahe)</label><select id="ceTeacher"></select>
+  <p id="ceMsg" style="font-size:13px;color:#64748b"></p>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+    <div><label>Start time</label><input id="ceStart" type="time" value="${esc(curTime.start)}"></div>
+    <div><label>End time</label><input id="ceEnd" type="time" value="${esc(curTime.end)}"></div>
+  </div>
+  <p style="font-size:13px;color:var(--muted)">Time badalne par ye time poore hafte ki Period ${period} ke liye badal jayega (slot time hai, ek cell ka nahi).</p>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
+    <button id="ceSave">${isLeave ? 'Save Substitute (' + esc(date) + ')' : 'Save Period'}</button>
+    <button id="ceFree" class="secondary">${hasSub ? 'Clear Substitute' : 'Set Free'}</button>
+    <button class="secondary" onclick="closeModal()">Cancel</button>
+  </div>`);
+  const fillTeachers = async () => {
+    const subj = $('#ceSubject').value;
+    const sel = $('#ceTeacher');
+    if (subj === 'Free') { sel.innerHTML = '<option value="">— Free (koi teacher nahi) —</option>'; sel.disabled = true; $('#ceMsg').textContent = 'Free period — teacher select na karein.'; return; }
+    sel.disabled = false;
+    let list = [];
+    try { list = await api('/api/timetable/available?day=' + encodeURIComponent(day) + '&period=' + period + '&class=' + encodeURIComponent(cls) + '&subject=' + encodeURIComponent(subj) + '&date=' + encodeURIComponent(date)); } catch (e) { $('#ceMsg').textContent = e.message; return; }
+    // Free cell rule: ONLY teachers with no class at this Day+Period are
+    // offered — busy / on-leave teachers are not listed at all here.
+    const free = list.filter(t => t.available && t.qualified);
+    const curId = row.teacher_id && !isLeave ? row.teacher_id : null;
+    sel.innerHTML = '<option value="">— Free (koi teacher nahi) —</option>'
+      + free.map(t => `<option value="${t.id}" ${curId === t.id ? 'selected' : ''}>${esc(t.name)} (${esc(t.subjects || '')})</option>`).join('');
+    $('#ceMsg').textContent = free.length
+      ? free.length + ' teacher(s) free hain is waqt (' + subj + ' ke liye) — busy ya chhuti wale teachers list mein nahi hain.'
+      : 'Is waqt ' + subj + ' ka koi teacher free nahi hai — period Free rakhein ya kisi aur din/period se teacher badlein.';
+  };
+  $('#ceSubject').onchange = fillTeachers;
+  await fillTeachers();
+  $('#ceSave').onclick = async () => {
+    try {
+      const subject = $('#ceSubject').value;
+      const teacherId = subject === 'Free' || !$('#ceTeacher').value ? null : Number($('#ceTeacher').value);
+      const start = $('#ceStart').value, end = $('#ceEnd').value;
+      if (isLeave) {
+        if (!teacherId) { alert('Substitute ke liye teacher chunein, ya “Clear Substitute” / “Set Free” dabayein.'); return; }
+        await api('/api/timetable/substitute', { method: 'POST', body: JSON.stringify({ class_name: cls, day, period, date, teacher_id: teacherId }) });
+        closeModal(); alert('Substitute lag gaya — ' + date + ' ke liye. Weekly timetable nahi badla.');
+      } else {
+        await api('/api/timetable/period', { method: 'POST', body: JSON.stringify({ class_name: cls, day, period, subject, teacher_id: teacherId, start_time: start, end_time: end }) });
+        closeModal(); alert('Period save ho gaya.');
+      }
+      loadTimetable();
+    } catch (e) { alert(e.message); }
+  };
+  $('#ceFree').onclick = async () => {
+    try {
+      if (hasSub || isLeave) {
+        await api('/api/timetable/substitute', { method: 'POST', body: JSON.stringify({ class_name: cls, day, period, date, teacher_id: null }) });
+        closeModal(); alert('Substitute hata diya — period phir “Free — chhuti” dikhega.');
+      } else {
+        await api('/api/timetable/period', { method: 'POST', body: JSON.stringify({ class_name: cls, day, period, subject: 'Free', teacher_id: null }) });
+        closeModal(); alert('Period Free kar diya gaya.');
+      }
+      loadTimetable();
+    } catch (e) { alert(e.message); }
+  };
+};
 
 // ---- Leaving / Promoted (admin only) ----
 let leavingSearch = '';
