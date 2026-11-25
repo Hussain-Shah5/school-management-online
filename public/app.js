@@ -593,7 +593,7 @@ function teacherForm(t) {
   </div>
   <label>Designation / Post</label><input id="t_des" placeholder="e.g. Teacher, Senior Teacher, Computer Teacher" list="t_des_list" value="${v('designation')}"><datalist id="t_des_list"><option>Teacher</option><option>Senior Teacher</option><option>Junior Teacher</option><option>Science Teacher</option><option>Computer Teacher</option><option>Qaria</option></datalist>
   <h4>Classes &amp; Subjects (assignments)</h4>
-  <p style="font-size:13px;color:var(--muted)">Class chunein, phir subject chunein, phir “Add assignment” dabayein. Ek teacher ko kayi classes/subjects diye ja sakte hain.</p>
+  <p style="font-size:13px;color:var(--muted)">Class chunein, phir subject chunein, phir “Add assignment” dabayein. Ek teacher ko kayi classes di ja sakti hain — lekin sirf <b>ek hi subject</b> (pehli assignment wala subject hi teacher ka subject ban jata hai, baaki subjects ki assignments save nahi hongi).</p>
   <div style="display:grid;grid-template-columns:1fr 1fr auto;gap:8px;align-items:end">
     <div><label>Class</label><select id="t_class">${CLASSES.map(c=>`<option>${c}</option>`).join('')}</select></div>
     <div><label>Subject</label><select id="t_subj"></select></div>
@@ -681,7 +681,7 @@ async function loadTimetable() {
   <div id="ttMatches"></div>
   ${timetableGridHTML(rows, { showClass: me.role === 'teacher', showTeacher: isAdmin })}
   ${isAdmin ? `<div class="card" style="margin-top:14px"><h3 style="margin-top:0">Edit a period (Admin)</h3>
-  <p style="font-size:13px;color:var(--muted)">Ek teacher ek hi waqt par sirf ek class mein ho sakta hai — jo teacher us Day + Period mein kisi aur class mein pehle se booked hai, wo is list mein <b>nahi</b> aayega (ya disabled dikhega, wajah ke saath). Koi teacher free nahi to period ko <b>Free</b> rakhein.</p>
+  <p style="font-size:13px;color:var(--muted)">Ek teacher ek hi waqt par sirf ek class mein ho sakta hai — jo teacher us Day + Period mein kisi aur class mein pehle se booked hai, wo is list mein <b>nahi</b> aayega (ya disabled dikhega, wajah ke saath). Sirf usi subject ke teacher dikhte hain jo subject aap ne chuna hai — dusre subject ka teacher kabhi offer nahi hota. Koi teacher free nahi to period ko <b>Free</b> rakhein.</p>
   <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end">
   <div><label style="margin:0 0 4px">Day</label><select id="epDay" style="max-width:130px">${TT_DAYS.map(d=>`<option>${d}</option>`).join('')}</select></div>
   <div><label style="margin:0 0 4px">Period</label><select id="epPeriod" style="max-width:100px">${[1,2,3,4,5,6].map(p=>`<option value="${p}">Period ${p}</option>`).join('')}</select></div>
@@ -710,19 +710,23 @@ async function loadTimetable() {
   if (isAdmin) {
     $('#tClass').onchange = e => { stuFilter.class = e.target.value; loadTimetable(); };
     $('#regen').onclick = async () => { const r = await api('/api/timetable/regenerate', { method: 'POST' }); alert('Timetable regenerate ho gaya — filled: ' + r.filled + ', Free: ' + r.free + ', conflicts: ' + r.conflicts); loadTimetable(); };
-    // Edit-a-period: teacher dropdown only offers teachers free at that Day+Period.
+    // Edit-a-period: teacher dropdown only offers teachers free at that Day+Period
+    // AND qualified for the chosen subject (one teacher = one subject — a
+    // teacher of another subject is never offered, even if free).
     const fillSubjects = () => { $('#epSubject').innerHTML = subjectsForClass(cls).map(s => `<option>${s}</option>`).join('') + '<option>Free</option>'; };
     const fillTeachers = async () => {
       const day = $('#epDay').value, period = $('#epPeriod').value;
-      let list = [];
-      try { list = await api('/api/timetable/available?day=' + encodeURIComponent(day) + '&period=' + period + '&class=' + encodeURIComponent(cls)); } catch (e) { $('#epMsg').textContent = e.message; return; }
       const subj = $('#epSubject').value;
-      const free = list.filter(t => t.available);
+      let list = [];
+      try { list = await api('/api/timetable/available?day=' + encodeURIComponent(day) + '&period=' + period + '&class=' + encodeURIComponent(cls) + '&subject=' + encodeURIComponent(subj)); } catch (e) { $('#epMsg').textContent = e.message; return; }
+      const free = list.filter(t => t.available && t.qualified);
       const booked = list.filter(t => !t.available);
+      const wrongSubject = list.filter(t => t.available && !t.qualified);
       $('#epTeacher').innerHTML = '<option value="">— Free (koi teacher nahi) —</option>'
         + free.map(t => `<option value="${t.id}">${esc(t.name)} (${esc(t.subjects || '')})</option>`).join('')
-        + booked.map(t => `<option value="${t.id}" disabled>${esc(t.name)} — busy: Class ${esc(t.bookedClass || '')} mein pehle se booked</option>`).join('');
-      $('#epMsg').textContent = subj === 'Free' ? 'Free period — teacher select na karein.' : (free.length ? free.length + ' teacher(s) free hain is waqt.' : 'Is waqt koi teacher free nahi hai — period Free rakhein.');
+        + booked.map(t => `<option value="${t.id}" disabled>${esc(t.name)} — busy: Class ${esc(t.bookedClass || '')} mein pehle se booked</option>`).join('')
+        + wrongSubject.map(t => `<option value="${t.id}" disabled>${esc(t.name)} — sirf ${esc(t.subjects || '')} parhate hain, ${esc(subj)} nahi</option>`).join('');
+      $('#epMsg').textContent = subj === 'Free' ? 'Free period — teacher select na karein.' : (free.length ? free.length + ' teacher(s) free hain is waqt (' + esc(subj) + ' ke liye).' : 'Is waqt ' + esc(subj) + ' ka koi teacher free nahi hai — period Free rakhein.');
     };
     fillSubjects();
     $('#epDay').onchange = fillTeachers; $('#epPeriod').onchange = fillTeachers; $('#epSubject').onchange = fillTeachers;
