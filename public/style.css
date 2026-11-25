@@ -160,4 +160,42 @@ td small{color:var(--muted)}
   .container{padding-bottom:96px}
   body{padding-bottom:0}
 }
+/* ---- Language toggle (English / اردو) — header + login ---- */
+.lang-toggle{display:inline-flex;gap:0;border:1px solid var(--line);border-radius:999px;overflow:hidden;background:#fff;box-shadow:var(--shadow-sm)}
+.lang-toggle button{background:transparent;color:var(--ink-soft);box-shadow:none;border:0;border-radius:0;padding:7px 12px;font-size:13px;font-weight:700}
+.lang-toggle button:hover{background:var(--paper-2);transform:none}
+.lang-toggle button.active{background:var(--board-2);color:#fff}
+header .lang-toggle{border-color:rgba(255,255,255,.35);background:rgba(255,255,255,.12)}
+header .lang-toggle button{color:#fff}
+header .lang-toggle button:hover{background:rgba(255,255,255,.18)}
+header .lang-toggle button.active{background:var(--gold);color:#3a2a05}
+.login-brand{position:relative}
+/* Urdu font: Nastaliq for Urdu text, layout stays LTR so the timetable
+   grid and tables do not break with longer Urdu text. */
+html[lang="ur"] body{font-family:'Noto Nastaliq Urdu','Inter',system-ui,sans-serif;line-height:1.9}
+html[lang="ur"] h1,html[lang="ur"] h2,html[lang="ur"] h3,html[lang="ur"] h4{font-family:'Noto Nastaliq Urdu','Fraunces',serif;line-height:1.9}
+html[lang="ur"] .tabs button,html[lang="ur"] .bottom-nav button{line-height:2}
+
+/* ---- Notifications (in-system) ---- */
+.notif-badge{display:inline-block;min-width:20px;padding:1px 6px;border-radius:999px;background:#dc2626;color:#fff;font-size:12px;font-weight:800;text-align:center;line-height:1.6;vertical-align:middle}
+#notifBell{position:relative}
+.notif-list{display:flex;flex-direction:column;gap:10px;margin-top:12px}
+.notif-item{display:flex;gap:12px;align-items:flex-start;border:1px solid var(--line);border-radius:12px;padding:12px 14px;background:var(--paper-2)}
+.notif-item.unread{background:#fffbeb;border-color:#f59e0b}
+.notif-ico{font-size:20px;line-height:1.4}
+.notif-body{flex:1;min-width:0}
+.notif-body p{margin:4px 0}
+.notif-body small{color:var(--muted)}
+
+/* ---- Exam accordion (student profile) ---- */
+.exam-acc-wrap{margin:6px 0}
+.exam-acc{border:1px solid var(--line);border-radius:12px;margin:8px 0;overflow:hidden;background:#fff}
+.exam-acc-head{width:100%;display:flex;justify-content:space-between;gap:8px;align-items:center;background:var(--paper-2);color:var(--board-2);box-shadow:none;border:0;border-radius:0;padding:10px 14px;font-weight:700;text-align:left}
+.exam-acc-head:hover{background:var(--board-soft);transform:none}
+.exam-acc-head span:nth-child(2){color:var(--muted);font-weight:600;font-size:13px}
+.exam-acc-chev{transition:transform .2s ease;color:var(--gold-deep)}
+.exam-acc.open .exam-acc-chev{transform:rotate(180deg)}
+.exam-acc-body{display:none;padding:12px 14px}
+.exam-acc.open .exam-acc-body{display:block}
+
 @media print{header,.tabs,.bottom-nav,.no-print{display:none!important}body{background:#fff}.hero{display:none}}

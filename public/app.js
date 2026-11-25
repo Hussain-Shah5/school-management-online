@@ -22,10 +22,129 @@ const downloadFile = async (url, filename) => {
 };
 let me = null, tab = 'dashboard', studentsCache = [], teachersCache = [], myClasses = [];
 let loginRole = 'admin';
-const TABS_ADMIN = [['dashboard','Dashboard'],['students','Students'],['attendance','Attendance'],['staffAttendance','Staff Attendance'],['fees','Fees'],['results','Results'],['teachers','Teachers & Staff'],['timetable','Timetable'],['leaving','Leaving / Promoted'],['backup','Backup & Export']];
-const TABS_TEACHER = [['dashboard','Dashboard'],['attendance','My Attendance'],['staffAttendance','My Staff Attendance'],['teachers','My Profile'],['timetable','My Timetable']];
-const TABS_PARENT = [['dashboard','Dashboard'],['students','My Child'],['timetable','Child Timetable']];
+const TABS_ADMIN = [['dashboard','tabDashboard'],['students','tabStudents'],['attendance','tabAttendance'],['staffAttendance','tabStaffAttendance'],['fees','tabFees'],['results','tabResults'],['teachers','tabTeachers'],['timetable','tabTimetable'],['leaving','tabLeaving'],['notifications','tabNotifications'],['backup','tabBackup']];
+const TABS_TEACHER = [['dashboard','tabDashboard'],['attendance','tabMyAttendance'],['staffAttendance','tabMyStaffAttendance'],['teachers','tabMyProfile'],['timetable','tabMyTimetable']];
+const TABS_PARENT = [['dashboard','tabDashboard'],['students','tabMyChild'],['notifications','tabNotifications'],['timetable','tabChildTimetable']];
 const tabsFor = () => me && me.role === 'teacher' ? TABS_TEACHER : me && me.role === 'parent' ? TABS_PARENT : TABS_ADMIN;
+// Exam terms: results are ONLY these three — the Add Result form offers
+// them as a dropdown (no free text). Old "Mid Term 2026" results match.
+const EXAM_OPTIONS = ['1st Term 2026', 'Mid Term 2026', 'Final Term 2026'];
+
+// ---- Language: English / اردو ----
+// Choice is kept in localStorage (so the login page already shows the
+// right language before login) AND saved per user on the server
+// (POST /api/language) so it survives a different browser. English is
+// the default. Layout stays LTR so the timetable grid and tables do not
+// break with longer Urdu text.
+let lang = 'en';
+try { lang = localStorage.getItem('sms-lang') || 'en'; } catch (e) { lang = 'en'; }
+if (lang !== 'ur') lang = 'en';
+const I18N = {
+  en: {
+    tabDashboard: 'Dashboard', tabStudents: 'Students', tabAttendance: 'Attendance', tabStaffAttendance: 'Staff Attendance',
+    tabFees: 'Fees', tabResults: 'Results', tabTeachers: 'Teachers & Staff', tabTimetable: 'Timetable',
+    tabLeaving: 'Leaving / Promoted', tabBackup: 'Backup & Export', tabNotifications: 'Notifications',
+    tabMyAttendance: 'My Attendance', tabMyStaffAttendance: 'My Staff Attendance', tabMyProfile: 'My Profile',
+    tabMyTimetable: 'My Timetable', tabMyChild: 'My Child', tabChildTimetable: 'Child Timetable',
+    cardActiveStudents: 'Active Students', cardPresentToday: 'Present Today', cardTeachers: 'Teachers',
+    cardFeesCollected: 'Fees Collected', cardFeesPending: 'Fees Pending', cardLeftSchool: 'Left School',
+    cardPromoted: 'Promoted', cardStaffPresent: 'Staff Present Today',
+    cardMyClasses: 'My Classes', cardMyStudents: 'My Students', cardPresentMine: 'Present Today in my classes', cardLateToday: 'Late Today (counted as present)',
+    cardMySubjects: 'My Subjects', cardMyAttendance: 'My Attendance', cardMyChild: 'My Child',
+    cardClass: 'Class', cardAttendance: 'Attendance', cardFeesPaid: 'Fees Paid', cardMidTerm: 'Mid Term Result',
+    studentsPerClass: 'Students per class (active)', latestExam: 'Latest exam',
+    appTitle: 'School Management System', loginSub: 'Attendance • Fees • Results • Teachers — all in one place.',
+    loginLine: 'School login — choose your role, then login.', iamRole: 'I am logging in as',
+    adminRole: 'Admin', teacherRole: 'Teacher', parentRole: 'Parent',
+    schoolNameLbl: 'School name (for register)', usernameLbl: 'Username', passwordLbl: 'Password',
+    parentPhoneLbl: 'Parent phone (the number on the child record)', studentRollLbl: 'Student roll no',
+    studentClassLbl: 'Student class', loginBtn: 'Login', createAccountBtn: 'Create Account',
+    logoutBtn: 'Logout', refreshBtn: 'Refresh', dateLbl: 'Date', monthLbl: 'Month',
+    heroSub: 'Attendance, fees, results and teachers — the whole school, on one dashboard.',
+    notifTitle: 'Notifications', notifEmpty: 'No notifications yet.',
+    notifUnread: 'unread', markAsRead: 'Mark as read', markAllRead: 'Mark all as read',
+    notifSend: 'Send Notification', notifMessage: 'Message', notifStudent: 'Student', notifLog: 'Notifications log',
+    notifFromSchool: 'Message from school', notifRead: 'Read',
+    examResults: 'Results', noResultYet: 'No result yet', clickExam: 'Click an exam to see its result',
+    saveBtn: 'Save', cancelBtn: 'Cancel', searchBtn: 'Search', clearBtn: 'Clear', printBtn: 'Print', closeBtn: 'Close',
+  },
+  ur: {
+    tabDashboard: 'ڈیش بورڈ', tabStudents: 'طلبہ', tabAttendance: 'حاضری', tabStaffAttendance: 'اسٹاف حاضری',
+    tabFees: 'فیس', tabResults: 'نتائج', tabTeachers: 'اساتذہ اور اسٹاف', tabTimetable: 'ٹائم ٹیبل',
+    tabLeaving: 'سکول چھوڑنے والے / ترقی پانے والے', tabBackup: 'بیک اپ اور ایکسپورٹ', tabNotifications: 'نوٹیفکیشن',
+    tabMyAttendance: 'میری حاضری', tabMyStaffAttendance: 'میری اسٹاف حاضری', tabMyProfile: 'میری پروفائل',
+    tabMyTimetable: 'میرا ٹائم ٹیبل', tabMyChild: 'میرا بچہ', tabChildTimetable: 'بچے کا ٹائم ٹیبل',
+    cardActiveStudents: 'فعال طلبہ', cardPresentToday: 'آج حاضر', cardTeachers: 'اساتذہ',
+    cardFeesCollected: 'فیس وصول شدہ', cardFeesPending: 'فیس بقایا', cardLeftSchool: 'سکول چھوڑ گئے',
+    cardPromoted: 'ترقی پانے والے', cardStaffPresent: 'آج حاضر اسٹاف',
+    cardMyClasses: 'میری کلاسیں', cardMyStudents: 'میرے طلبہ', cardPresentMine: 'میری کلاسوں میں آج حاضر', cardLateToday: 'آج دیر سے آنے والے (حاضر میں شامل)',
+    cardMySubjects: 'میرے مضامین', cardMyAttendance: 'میری حاضری', cardMyChild: 'میرا بچہ',
+    cardClass: 'کلاس', cardAttendance: 'حاضری', cardFeesPaid: 'فیس ادا شدہ', cardMidTerm: 'مڈ ٹرم نتیجہ',
+    studentsPerClass: 'ہر کلاس میں طلبہ (فعال)', latestExam: 'تازہ ترین امتحان',
+    appTitle: 'سکول مینجمنٹ سسٹم', loginSub: 'حاضری • فیس • نتائج • اساتذہ — سب ایک جگہ۔',
+    loginLine: 'سکول لاگ ان — اپنا رول چنیں، پھر لاگ ان کریں۔', iamRole: 'میں لاگ ان کر رہا/رہی ہوں بطور',
+    adminRole: 'ایڈمن', teacherRole: 'استاد', parentRole: 'والدین',
+    schoolNameLbl: 'سکول کا نام (رجسٹر کے لیے)', usernameLbl: 'یوزر نیم', passwordLbl: 'پاس ورڈ',
+    parentPhoneLbl: 'والدین کا فون (بچے کے ریکارڈ والا نمبر)', studentRollLbl: 'طالب علم کا رول نمبر',
+    studentClassLbl: 'طالب علم کی کلاس', loginBtn: 'لاگ ان', createAccountBtn: 'اکاؤنٹ بنائیں',
+    logoutBtn: 'لاگ آؤٹ', refreshBtn: 'ریفریش', dateLbl: 'تاریخ', monthLbl: 'مہینہ',
+    heroSub: 'حاضری، فیس، نتائج اور اساتذہ — پورا سکول، ایک ڈیش بورڈ پر۔',
+    notifTitle: 'نوٹیفکیشن', notifEmpty: 'ابھی کوئی نوٹیفکیشن نہیں ہے۔',
+    notifUnread: 'نہیں پڑھے', markAsRead: 'پڑھا ہوا نشان زد کریں', markAllRead: 'سب پڑھے ہوئے نشان زد کریں',
+    notifSend: 'نوٹیفکیشن بھیجیں', notifMessage: 'پیغام', notifStudent: 'طالب علم', notifLog: 'نوٹیفکیشن لاگ',
+    notifFromSchool: 'سکول کی طرف سے پیغام', notifRead: 'پڑھا ہوا',
+    examResults: 'نتائج', noResultYet: 'ابھی نتیجہ نہیں ہے', clickExam: 'نتیجہ دیکھنے کے لیے امتحان پر کلک کریں',
+    saveBtn: 'محفوظ کریں', cancelBtn: 'منسوخ کریں', searchBtn: 'تلاش کریں', clearBtn: 'صاف کریں', printBtn: 'پرنٹ کریں', closeBtn: 'بند کریں',
+  },
+};
+const t = k => (I18N[lang] && I18N[lang][k]) || I18N.en[k] || k;
+// Exact-phrase translation for buttons/labels rendered with literal
+// English text inside the views (Save, Cancel, Search, ...). Only an
+// element whose WHOLE text matches is translated, so names and numbers
+// are never touched.
+const PHRASE_UR = {
+  'Save': 'محفوظ کریں', 'Save (server)': 'محفوظ کریں (سرور)', 'Cancel': 'منسوخ کریں', 'Search': 'تلاش کریں',
+  'Clear': 'صاف کریں', 'Close': 'بند کریں', 'Print': 'پرنٹ کریں', 'Print Result Card': 'رزلٹ کارڈ پرنٹ کریں',
+  'Print Report Card': 'رپورٹ کارڈ پرنٹ کریں', 'Refresh': 'ریفریش کریں', 'Logout': 'لاگ آؤٹ', 'Login': 'لاگ ان',
+  'Create Account': 'اکاؤنٹ بنائیں', 'Create Parent Account': 'والدین کا اکاؤنٹ بنائیں',
+  'Create Account (admin only for teachers)': 'اکاؤنٹ بنائیں (اساتذہ کے لیے صرف ایڈمن)', 'Edit': 'ترمیم کریں', 'Delete': 'حذف کریں', 'Profile': 'پروفائل',
+  'View Full Profile': 'مکمل پروفائل دیکھیں', 'Mark all Present': 'سب کو حاضر نشان زد کریں',
+  'Save Attendance': 'حاضری محفوظ کریں', 'Save Staff Attendance': 'اسٹاف حاضری محفوظ کریں',
+  'Save Result (server)': 'نتیجہ محفوظ کریں (سرور)', 'Save Teacher (server)': 'استاد محفوظ کریں (سرور)',
+  'Update Teacher': 'استاد اپ ڈیٹ کریں', 'Save Period': 'پیریڈ محفوظ کریں', 'Save Settings': 'سیٹنگز محفوظ کریں',
+  'Save Substitute': 'سبسٹیٹیوٹ محفوظ کریں', 'Set Free': 'فری کر دیں', 'Clear Substitute': 'سبسٹیٹیوٹ ہٹا دیں',
+  'Record payment': 'ادائیگی درج کریں', 'Generate challans for this month': 'اس مہینے کے چالان بنائیں',
+  'Export Students CSV': 'طلبہ CSV ایکسپورٹ کریں', 'Export Fees CSV': 'فیس CSV ایکسپورٹ کریں',
+  'Export Results CSV': 'نتائج CSV ایکسپورٹ کریں', 'Export Attendance CSV': 'حاضری CSV ایکسپورٹ کریں',
+  'Download Full Backup (.db)': 'مکمل بیک اپ ڈاؤن لوڈ کریں (.db)',
+  'Regenerate from teacher assignments': 'استاد اسائنمنٹس سے دوبارہ بنائیں',
+  '+ Add Student': '+ طالب علم شامل کریں', '+ Add Result': '+ نتیجہ شامل کریں',
+  '+ Add Teacher / Staff': '+ استاد / اسٹاف شامل کریں', 'Add assignment': '+ اسائنمنٹ شامل کریں',
+  'Mark as Left School': 'سکول چھوڑنے والا نشان زد کریں', 'Promote': 'ترقی دیں',
+  'Mark as read': 'پڑھا ہوا نشان زد کریں', 'Mark all as read': 'سب پڑھے ہوئے نشان زد کریں',
+  'Send Notification': 'نوٹیفکیشن بھیجیں',
+};
+function translateDom(root) {
+  if (lang !== 'ur') return;
+  (root || document).querySelectorAll('button, h3, h4, label, th').forEach(el => {
+    const txt = (el.textContent || '').trim();
+    if (txt && PHRASE_UR[txt]) el.textContent = PHRASE_UR[txt];
+  });
+}
+function applyStaticLang() {
+  document.documentElement.lang = lang;
+  document.querySelectorAll('.lang-toggle button').forEach(b => b.classList.toggle('active', b.dataset.lang === lang));
+  document.querySelectorAll('[data-i18n]').forEach(el => { const k = el.dataset.i18n; if (I18N[lang][k]) el.textContent = t(k); });
+}
+function setLang(l, save) {
+  lang = l === 'ur' ? 'ur' : 'en';
+  try { localStorage.setItem('sms-lang', lang); } catch (e) { /* private mode */ }
+  applyStaticLang();
+  if (save !== false && me && me.loggedIn) api('/api/language', { method: 'POST', body: JSON.stringify({ language: lang }) }).catch(() => {});
+  if (me && me.loggedIn) { renderTabs(); loadTab(tab); updateNotifBadge(); }
+  else setRole(loginRole);
+}
+document.querySelectorAll('.lang-toggle button').forEach(b => b.onclick = () => setLang(b.dataset.lang));
 const CLASSES = ['Nursery','KG','1','2','3','4','5','6','7','8','9','10'];
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 // Subjects taught in each class (same list as the server's subjectsForClass).
@@ -90,6 +209,7 @@ function setRole(role) {
   $('#parentFields').classList.toggle('hidden', role !== 'parent');
   $('#adminFields').classList.toggle('hidden', role === 'parent');
   $('#registerBtn').textContent = role === 'parent' ? 'Create Parent Account' : role === 'teacher' ? 'Create Account (admin only for teachers)' : 'Create Account';
+  if (lang === 'ur') { const rb = $('#registerBtn'); if (PHRASE_UR[rb.textContent.trim()]) rb.textContent = PHRASE_UR[rb.textContent.trim()]; }
   if (role === 'admin') { $('#username').value = 'admin'; $('#password').value = 'admin123'; }
   if (role === 'teacher') { $('#username').value = 'ahmed'; $('#password').value = 'teacher123'; }
   if (role === 'parent') { $('#username').value = 'parent1'; $('#password').value = 'parent123'; }
@@ -102,16 +222,27 @@ async function checkLogin() {
   $('#loginView').classList.toggle('hidden', !!me.loggedIn);
   $('#appView').classList.toggle('hidden', !me.loggedIn);
   if (me.loggedIn) {
+    // Server-saved language wins when this browser has no saved choice yet.
+    try {
+      if (!localStorage.getItem('sms-lang') && me.language && me.language !== lang) {
+        lang = me.language === 'ur' ? 'ur' : 'en';
+        localStorage.setItem('sms-lang', lang);
+      }
+    } catch (e) { /* private mode */ }
+    applyStaticLang();
     $('#schoolTitle').textContent = me.schoolName + ' — School Management System';
     const heroTitle = $('#heroTitle'); if (heroTitle) heroTitle.textContent = me.schoolName;
     const heroDate = $('#heroDate'); if (heroDate) heroDate.textContent = new Date($('#todayInput').value + 'T00:00:00').toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' });
     $('#userLine').textContent = 'Logged in as ' + me.username + ' (' + (me.role || 'admin') + ')';
     if (!tabsFor().some(([k]) => k === tab)) tab = 'dashboard';
-    renderTabs(); loadDashboard();
+    renderTabs(); loadDashboard(); updateNotifBadge();
+  } else {
+    applyStaticLang();
   }
 }
 $('#loginBtn').onclick = async () => {
-  try { await api('/api/login', { method: 'POST', body: JSON.stringify({ username: $('#username').value, password: $('#password').value }) }); $('#loginMsg').textContent = ''; checkLogin(); }
+  try { await api('/api/login', { method: 'POST', body: JSON.stringify({ username: $('#username').value, password: $('#password').value }) }); $('#loginMsg').textContent = ''; applyStaticLang();
+checkLogin(); }
   catch (e) { $('#loginMsg').textContent = e.message; }
 };
 $('#registerBtn').onclick = async () => {
@@ -123,6 +254,8 @@ $('#registerBtn').onclick = async () => {
   } catch (e) { $('#loginMsg').textContent = e.message; }
 };
 $('#logoutBtn').onclick = async () => { await api('/api/logout', { method: 'POST' }); checkLogin(); };
+const notifBellBtn = $('#notifBell');
+if (notifBellBtn) notifBellBtn.onclick = () => { tab = 'notifications'; renderTabs(); loadTab('notifications'); window.scrollTo({ top: 0, behavior: 'smooth' }); };
 // Dashboard cards are live data, not a snapshot: refresh them whenever
 // attendance (student or staff) is saved, and whenever the Date/Month
 // changes. Previously the dashboard was only fetched once at login, so an
@@ -139,48 +272,135 @@ $('#todayInput').onchange = () => refreshDashboard();
 $('#monthInput').onchange = () => refreshDashboard();
 function renderTabs() {
   const tabs = tabsFor();
-  $('#tabs').innerHTML = tabs.map(([k, l]) => `<button data-t="${k}" class="${k===tab?'active':''}">${l}</button>`).join('');
+  $('#tabs').innerHTML = tabs.map(([k, l]) => `<button data-t="${k}" class="${k===tab?'active':''}">${esc(t(l))}</button>`).join('');
   document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => { tab = b.dataset.t; renderTabs(); loadTab(tab); });
   // Fixed bottom nav (mobile): same tabs, so every section is one tap away on phone.
   const nav = $('#bottomNav');
   if (nav) {
-    nav.innerHTML = tabs.map(([k, l]) => `<button data-t="${k}" class="${k===tab?'active':''}">${l}</button>`).join('');
+    nav.innerHTML = tabs.map(([k, l]) => `<button data-t="${k}" class="${k===tab?'active':''}">${esc(t(l))}</button>`).join('');
     nav.querySelectorAll('button').forEach(b => b.onclick = () => { tab = b.dataset.t; renderTabs(); loadTab(tab); window.scrollTo({ top: 0, behavior: 'smooth' }); });
   }
 }
-function loadTab(t) { ({ dashboard: loadDashboard, students: loadStudents, attendance: loadAttendance, staffAttendance: loadStaffAttendance, fees: loadFees, results: loadResults, teachers: loadTeachers, timetable: loadTimetable, leaving: loadLeaving, backup: loadBackup })[t](); }
+function loadTab(t) { ({ dashboard: loadDashboard, students: loadStudents, attendance: loadAttendance, staffAttendance: loadStaffAttendance, fees: loadFees, results: loadResults, teachers: loadTeachers, timetable: loadTimetable, leaving: loadLeaving, notifications: loadNotifications, backup: loadBackup })[t](); }
+
+// ---- Notifications bell (header) + parent notifications ----
+// The bell shows the unread count for the logged-in parent (or admin).
+// Teachers have no parent notifications, so the bell stays hidden for them.
+async function updateNotifBadge() {
+  const bell = $('#notifBell'), count = $('#notifCount');
+  if (!bell || !count) return;
+  if (!me || !me.loggedIn || me.role === 'teacher') { bell.classList.add('hidden'); return; }
+  bell.classList.remove('hidden');
+  try {
+    const d = await api('/api/notifications');
+    const n = d.unreadCount || 0;
+    count.textContent = n > 0 ? String(n) : '';
+    count.classList.toggle('hidden', n === 0);
+  } catch (e) { count.textContent = ''; count.classList.add('hidden'); }
+}
+window.markNotifRead = async (id) => {
+  try { await api('/api/notifications/' + id + '/read', { method: 'POST' }); } catch (e) { alert(e.message); return; }
+  updateNotifBadge(); loadNotifications();
+};
+async function loadNotifications() {
+  const d = await api('/api/notifications');
+  const rows = d.notifications || [];
+  const typeIcon = (ty) => ty === 'absence' ? '🔴' : ty === 'late' ? '⏰' : ty === 'fee' ? '💰' : ty === 'result' ? '📝' : '✉️';
+  const when = (n) => esc((n.created_at || '').slice(0, 16).replace('T', ' '));
+  if (me.role === 'parent') {
+    $('#view').innerHTML = `<div class="card"><h3>🔔 ${esc(t('notifTitle'))}</h3>
+    <p>${rows.length ? rows.length + ' notification(s) — ' + (d.unreadCount || 0) + ' ' + esc(t('notifUnread')) + '.' : esc(t('notifEmpty'))}</p>
+    ${d.unreadCount ? `<button id="notifReadAll">${esc(t('markAllRead'))}</button>` : ''}
+    <div class="notif-list">${rows.map(n => `<div class="notif-item ${n.is_read ? '' : 'unread'}">
+      <div class="notif-ico">${typeIcon(n.type)}</div>
+      <div class="notif-body"><b>${esc(n.title)}</b><p>${esc(n.message)}</p><small>${when(n)} • ${esc(n.type)}</small></div>
+      ${n.is_read ? `<span class="badge">${esc(t('notifRead'))}</span>` : `<button class="secondary" onclick="markNotifRead(${n.id})">${esc(t('markAsRead'))}</button>`}
+    </div>`).join('') || `<p>${esc(t('notifEmpty'))}</p>`}</div></div>`;
+    const ra = $('#notifReadAll');
+    if (ra) ra.onclick = async () => { await api('/api/notifications/read-all', { method: 'POST' }); updateNotifBadge(); loadNotifications(); };
+    translateDom($('#view'));
+    return;
+  }
+  // Admin: send a manual notification to one parent + full log.
+  $('#view').innerHTML = `<div class="card"><h3>🔔 ${esc(t('notifTitle'))} — Admin</h3>
+  <p>${esc(t('notifSend'))} — ${esc(t('notifStudent'))} chunein, ${esc(t('notifMessage'))} likhein, bhej dein. Notification sirf us bachay ke parent ki login mein dikhega — kisi aur parent ko nahi.</p>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:10px">
+    <div style="flex:1;min-width:220px"><label style="margin:0 0 4px">${esc(t('notifStudent'))} (naam se search karein)</label><input id="nmSearch" placeholder="e.g. Sara, Noor Ali"></div>
+    <button id="nmGo" class="secondary">${esc(t('searchBtn'))}</button>
+  </div>
+  <div><label style="margin:0 0 4px">${esc(t('notifStudent'))}</label><select id="nmStudent"></select></div>
+  <div><label style="margin:0 0 4px">Title (optional)</label><input id="nmTitle" placeholder="Message from school"></div>
+  <div><label style="margin:0 0 4px">${esc(t('notifMessage'))}</label><textarea id="nmMsg" rows="3" placeholder="e.g. Kal parent-teacher meeting hai — subah 9 baje school tashreef layein."></textarea></div>
+  <div style="display:flex;gap:8px;margin-top:10px"><button id="nmSend">${esc(t('notifSend'))}</button><span id="nmMsg2" style="font-size:13px;align-self:center"></span></div></div>
+  <div class="card" style="margin-top:14px"><h3>${esc(t('notifLog'))} (${rows.length})</h3>
+  <div style="overflow-x:auto"><table><tr><th>${esc(t('notifStudent'))}</th><th>Class</th><th>Parent</th><th>Type</th><th>Message</th><th>Date</th><th>Status</th></tr>
+  ${rows.map(n => `<tr><td>${esc(n.student_name || '')}</td><td>${esc(n.class_name || '')}</td><td>${esc(n.parent_username || '—')}</td><td>${esc(n.type)}</td><td><b>${esc(n.title)}</b><br><small>${esc(n.message)}</small></td><td>${when(n)}</td><td>${n.is_read ? '<span class="badge">Read</span>' : '<span class="badge pending">Unread</span>'}</td></tr>`).join('') || '<tr><td colspan="7">No notifications yet.</td></tr>'}</table></div></div>`;
+  const fillStudents = async () => {
+    const q = ($('#nmSearch').value || '').trim();
+    const list = await api('/api/students?' + new URLSearchParams({ search: q }));
+    $('#nmStudent').innerHTML = list.slice(0, 100).map(s => `<option value="${s.id}">${esc(s.name)} — Class ${esc(s.class_name)}, Roll ${esc(s.roll_no)}</option>`).join('') || '<option value="">No student found</option>';
+  };
+  $('#nmGo').onclick = fillStudents;
+  $('#nmSearch').onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); fillStudents(); } };
+  await fillStudents();
+  $('#nmSend').onclick = async () => {
+    try {
+      const msg = ($('#nmMsg').value || '').trim();
+      if (!msg) { alert('Please write a message first.'); return; }
+      const r = await api('/api/notifications', { method: 'POST', body: JSON.stringify({ student_id: +$('#nmStudent').value, title: $('#nmTitle').value.trim(), message: msg }) });
+      $('#nmMsg2').textContent = 'Notification bhej di gayi — ' + r.student + ' ke parent ko dikhegi.';
+      $('#nmMsg').value = ''; $('#nmTitle').value = '';
+      updateNotifBadge(); loadNotifications();
+    } catch (e) { const m = $('#nmMsg2'); if (m) m.textContent = e.message; else alert(e.message); }
+  };
+  translateDom($('#view'));
+}
 
 async function loadDashboard() {
   const d = await api(`/api/dashboard?today=${$('#todayInput').value}&month=${$('#monthInput').value}`);
   if (d.role === 'teacher') {
     myClasses = d.myClasses || [];
     $('#dashCards').innerHTML = [
-      [d.myClasses.length, 'My Classes'], [d.myStudents, 'My Students'], [d.present, 'Present Today in my classes'],
-      [d.mySubjects.join(', '), 'My Subjects'], [d.attPct + '%', 'My Attendance'],
+      [d.myClasses.length, t('cardMyClasses')], [d.myStudents, t('cardMyStudents')], [d.present, t('cardPresentMine')], [d.late || 0, t('cardLateToday')],
+      [d.mySubjects.join(', '), t('cardMySubjects')], [d.attPct + '%', t('cardMyAttendance')],
     ].map(([v, l]) => `<div class="card"><b>${v}</b><span>${l}</span></div>`).join('');
     $('#view').innerHTML = `<div class="card"><h3>Assalam-o-Alaikum, ${esc(d.teacherName)} — Subject-wise student progress (Mid Term 2026)</h3>
     ${d.progress.map(p => `<div class="progress-row"><span>Class ${esc(p.class_name)} ${esc(p.subject)}</span><div class="bar"><i style="width:${p.avg}%"></i></div><b>${p.avg}%</b></div>`).join('') || '<p>No assignments yet.</p>'}
     <p>Attendance sirf apni classes ki mark karein — My Attendance tab se. Fees aur salaries teacher ko nazar nahi aati.</p></div>`;
+    translateDom($('#view'));
     return;
   }
   if (d.role === 'parent') {
     const c = d.child;
     $('#dashCards').innerHTML = [
-      [esc(c.name), 'My Child'], ['Class ' + esc(c.class_name) + '-' + esc(c.section), 'Class (Roll ' + esc(c.roll_no) + ')'],
-      [d.attPct + '%', 'Attendance'], ['Rs ' + d.feesPaid.toLocaleString(), 'Fees Paid'], ['Rs ' + d.feesPending.toLocaleString(), 'Fees Pending'],
-      [d.resultPct + '% (' + d.grade + ')', 'Mid Term Result'],
+      [esc(c.name), t('cardMyChild')], ['Class ' + esc(c.class_name) + '-' + esc(c.section), t('cardClass') + ' (Roll ' + esc(c.roll_no) + ')'],
+      [d.attPct + '%', t('cardAttendance')], ['Rs ' + d.feesPaid.toLocaleString(), t('cardFeesPaid')], ['Rs ' + d.feesPending.toLocaleString(), t('cardFeesPending')],
+      [d.resultPct + '% (' + d.grade + ')', t('cardMidTerm')],
     ].map(([v, l]) => `<div class="card"><b>${v}</b><span>${l}</span></div>`).join('');
-    $('#view').innerHTML = `<div class="card"><h3>${esc(c.name)} — poori profile</h3><p>Father: ${esc(c.father_name)} | Class ${esc(c.class_name)}-${esc(c.section)} | Roll ${esc(c.roll_no)}</p>
-    <p>Attendance: ${d.attPresent} / ${d.attTotal} days present (${d.attPct}%). Fees: Rs ${d.feesPaid.toLocaleString()} paid of Rs ${d.feesTotal.toLocaleString()}.</p>
+    $('#view').innerHTML = `<div class="card" id="parentNotifCard"><h3>🔔 ${esc(t('notifTitle'))} ${d.unreadCount ? `<span class="notif-badge">${d.unreadCount}</span>` : ''}</h3><div id="parentNotifPreview"><p>Loading notifications…</p></div>
+    <button onclick="tab='notifications';renderTabs();loadTab('notifications')">${esc(t('notifTitle'))}</button></div>
+    <div class="card"><h3>${esc(c.name)} — poori profile</h3><p>Father: ${esc(c.father_name)} | Class ${esc(c.class_name)}-${esc(c.section)} | Roll ${esc(c.roll_no)}</p>
+    <p>Attendance: ${d.attPresent} / ${d.attTotal} days present (${d.attPct}%)${d.attLate ? ' — ' + d.attLate + ' late (late bhi present mein shamil hai)' : ''}. Fees: Rs ${d.feesPaid.toLocaleString()} paid of Rs ${d.feesTotal.toLocaleString()}.</p>
     <button onclick="tab='students';renderTabs();loadTab('students')">View Full Profile</button></div>`;
+    // Latest unread notifications on the parent dashboard (own child only).
+    try {
+      const nd = await api('/api/notifications');
+      const un = (nd.notifications || []).filter(n => !n.is_read).slice(0, 3);
+      const box = $('#parentNotifPreview');
+      if (box) box.innerHTML = un.length
+        ? un.map(n => `<p style="margin:6px 0"><b>${esc(n.title)}</b><br><small>${esc(n.message)}</small><br><small>${esc((n.created_at || '').slice(0, 16).replace('T', ' '))}</small></p>`).join('')
+        : `<p>${esc(t('notifEmpty'))}</p>`;
+    } catch (e) { const box = $('#parentNotifPreview'); if (box) box.innerHTML = ''; }
+    translateDom($('#view'));
     return;
   }
   $('#dashCards').innerHTML = [
-    [d.total, 'Active Students'], [d.present, 'Present Today (' + d.today + ')'], [d.teachers, 'Teachers'],
-    ['Rs ' + d.feesCollected.toLocaleString(), 'Fees Collected (' + d.month + ')'],
-    ['Rs ' + d.feesPending.toLocaleString(), 'Fees Pending'], [d.left, 'Left School'], [d.promoted, 'Promoted'], [d.staffPresent, 'Staff Present Today'],
+    [d.total, t('cardActiveStudents')], [d.present, t('cardPresentToday') + ' (' + d.today + ')'], [d.late || 0, t('cardLateToday')], [d.teachers, t('cardTeachers')],
+    ['Rs ' + d.feesCollected.toLocaleString(), t('cardFeesCollected') + ' (' + d.month + ')'],
+    ['Rs ' + d.feesPending.toLocaleString(), t('cardFeesPending')], [d.left, t('cardLeftSchool')], [d.promoted, t('cardPromoted')], [d.staffPresent, t('cardStaffPresent')],
   ].map(([v, l]) => `<div class="card"><b>${v}</b><span>${l}</span></div>`).join('');
-  $('#view').innerHTML = `<div class="card"><h3>Students per class (active)</h3>${d.byClass.map(c => `<div class="progress-row"><span>Class ${esc(c.class_name)}</span><div class="bar"><i style="width:${Math.min(100, c.c / 25 * 100)}%"></i></div><b>${c.c}</b></div>`).join('')}<p>Total students in system: ${d.totalAll} (249 seeded). Attendance today: ${d.attendance.map(a => a.status + ' ' + a.c).join(', ') || 'not marked yet'}.</p></div>`;
+  $('#view').innerHTML = `<div class="card"><h3>${esc(t('studentsPerClass'))}</h3>${d.byClass.map(c => `<div class="progress-row"><span>Class ${esc(c.class_name)}</span><div class="bar"><i style="width:${Math.min(100, c.c / 25 * 100)}%"></i></div><b>${c.c}</b></div>`).join('')}<p>Total students in system: ${d.totalAll} (249 seeded). Attendance today: ${d.attendance.map(a => a.status + ' ' + a.c).join(', ') || 'not marked yet'}.</p></div>`;
+  translateDom($('#view'));
 }
 
 // ---- Students ----
@@ -232,6 +452,7 @@ async function loadStudents() {
     $('#addStu').onclick = () => studentForm();
     $('#expStu').onclick = () => downloadFile('/api/export/students', 'students.csv').catch(e => alert(e.message));
   }
+  translateDom($('#view'));
 }
 function studentForm(s) {
   s = s || {};
@@ -255,6 +476,19 @@ function studentForm(s) {
 }
 const gradeFor = pct => pct >= 90 ? 'A+' : pct >= 80 ? 'A' : pct >= 70 ? 'B' : pct >= 60 ? 'C' : pct >= 50 ? 'D' : 'F';
 const yearOf = (exam, date) => ((exam || '').match(/\b(20\d\d)\b/) || [])[1] || (date ? String(date).slice(0, 4) : '');
+// Exam accordion (student profile): only ONE exam section is open at a
+// time. Clicking a closed exam opens it and closes the others; clicking
+// the open one closes it. Works on the .exam-acc blocks inside the open
+// profile modal.
+window.toggleExamAccordion = (exam) => {
+  document.querySelectorAll('.exam-acc').forEach(el => {
+    const isTarget = el.dataset.exam === exam;
+    const wasOpen = el.classList.contains('open');
+    el.classList.toggle('open', isTarget && !wasOpen);
+    const head = el.querySelector('.exam-acc-head');
+    if (head) head.setAttribute('aria-expanded', String(isTarget && !wasOpen));
+  });
+};
 window.viewStudent = async (id) => {
   const s = await api('/api/students/' + id);
   // Current class results only — previous-class results live in their own section below.
@@ -277,10 +511,41 @@ window.viewStudent = async (id) => {
   window._curStudent = s;
   window._prevRows = prevRows;
   const isAdmin = me.role === 'admin';
+  // ---- Exam accordion data (current class only) ----
+  // One section per term — 1st, Mid, Final — each with its own subjects,
+  // total, % and grade. Default open = the LATEST exam that has a result
+  // (Final if it exists, otherwise Mid, otherwise 1st). An exam with no
+  // result yet shows "No result yet" and opens to an empty message.
+  const byExam = {};
+  curResults.forEach(r => { (byExam[r.exam] = byExam[r.exam] || []).push(r); });
+  const examStats = EXAM_OPTIONS.map(ex => {
+    const rows = (byExam[ex] || []).slice().sort((a, b) => String(a.subject).localeCompare(String(b.subject)));
+    const m = rows.reduce((a, r) => a + r.marks, 0), tt = rows.reduce((a, r) => a + r.total_marks, 0);
+    const p = tt ? (m / tt * 100) : null;
+    return { ex, rows, pct: p === null ? null : p.toFixed(1), marks: m, total: tt };
+  });
+  const latestExam = [...examStats].reverse().find(e => e.rows.length) || null;
+  const examAccordionHTML = `<h4>${esc(t('examResults'))} — Current Class ${esc(s.class_name)}</h4>
+  <p style="font-size:13px;color:var(--muted)">${esc(t('clickExam'))}. ${latestExam ? esc(t('latestExam')) + ': <b>' + esc(latestExam.ex) + ' — ' + latestExam.pct + '% (' + gradeFor(+latestExam.pct) + ')</b>' : esc(t('noResultYet')) + '.'}</p>
+  <div class="exam-acc-wrap">
+  ${examStats.map(e => `
+  <div class="exam-acc ${latestExam && e.ex === latestExam.ex ? 'open' : ''}" data-exam="${esc(e.ex)}">
+    <button type="button" class="exam-acc-head" aria-expanded="${latestExam && e.ex === latestExam.ex ? 'true' : 'false'}" onclick="toggleExamAccordion('${esc(e.ex)}')">
+      <span>${esc(e.ex)}</span>
+      <span>${e.rows.length ? e.pct + '% (' + gradeFor(+e.pct) + ') • ' + e.rows.length + ' subjects' : esc(t('noResultYet'))}</span>
+      <span class="exam-acc-chev">▾</span>
+    </button>
+    <div class="exam-acc-body">
+      ${e.rows.length
+        ? `<table><tr><th>Subject</th><th>Marks</th><th>%</th></tr>${e.rows.map(r => `<tr><td>${esc(r.subject)}</td><td>${r.marks}/${r.total_marks}</td><td>${(r.marks / r.total_marks * 100).toFixed(1)}%</td></tr>`).join('')}</table>
+           <p><b>Total: ${e.marks} / ${e.total} &nbsp;•&nbsp; Percentage: ${e.pct}% &nbsp;•&nbsp; Grade: ${gradeFor(+e.pct)}</b></p>`
+        : `<p>${esc(t('noResultYet'))} — ${esc(e.ex)} ka result abhi add nahi hua.</p>`}
+    </div>
+  </div>`).join('')}
+  </div>`;
   openModal(`<h3>${esc(s.name)} — Class ${esc(s.class_name)}-${esc(s.section)}</h3>
   <p>Roll ${esc(s.roll_no)} | Father: ${esc(s.father_name)} | Phone: ${esc(s.phone)}<br>B-Form No: ${esc(s.b_form_no || '— not recorded yet (Edit se add karein)')} | Monthly fee Rs ${s.monthly_fee} | Admission ${esc(s.admission_date)} | Status ${s.status}</p>
-  <h4>Results — Current Class ${esc(s.class_name)} — ${pct}% (${gradeFor(+pct)})</h4><div class="bar"><i style="width:${pct}%"></i></div>
-  <table><tr><th>Exam</th><th>Subject</th><th>Marks</th></tr>${curResults.map(r=>`<tr><td>${esc(r.exam)}</td><td>${esc(r.subject)}</td><td>${r.marks}/${r.total_marks}</td></tr>`).join('') || '<tr><td colspan="3">No results yet for the current class.</td></tr>'}</table>
+  ${examAccordionHTML}
   <h4>Previous Class Results</h4>
   ${prevRows.length ? `<table><tr><th>Exam</th><th>Class</th><th>Total</th><th>%</th><th>Grade</th><th>Year</th><th></th></tr>${prevRows.map((r, i)=>`<tr><td>${esc(r.exam)}</td><td>${esc(r.cls)}</td><td>${esc(r.marks)}</td><td>${r.pct}%</td><td>${gradeFor(+r.pct)}</td><td>${esc(r.year)}</td><td><button class="secondary" onclick="viewPrevReportCard(${i})">View Report Card</button></td></tr>`).join('')}</table><p style="font-size:13px;color:var(--muted)">“View Report Card” se us purani class/exam ka poora report card khulta hai — subjects, marks, total, percentage aur grade ke saath. Promotion-record rows come from the promotion history; subject-result rows were added with a previous class chosen in Add Result.</p>` : '<p>No previous class results yet. Admin/teacher can add one from Results → + Add Result, class chunein (purani class), aur exam/marks likhein.</p>'}
   <h4>Fees</h4>${s.fees.map(f=>`<p>${f.month}: Rs ${f.paid}/${f.amount} — ${f.status}</p>`).join('')}
@@ -373,6 +638,7 @@ async function loadAttendance() {
     ? `<select data-sid="${s.id}" class="aStatus">${statusOpts(savedAtt[s.id] || 'Present')}</select>`
     : `<b>${esc(savedAtt[s.id] || 'Not marked yet')}</b>`;
   $('#view').innerHTML = `<div class="card"><h3>Attendance — ${date}${isTeacher ? ' (my classes only)' : ''}</h3>
+  <p style="font-size:13px;color:var(--muted)">Late ka matlab: Period 1 (08:00) se 30 minute ya zyada late (08:30 ya baad) aaye to Late mark karein — time likhne ki zaroorat nahi, sirf Late select karein. Late bhi present mein shamil hota hai.</p>
   <div id="aPerm" style="margin:8px 0"></div>
   <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:8px">
   <div><label style="margin:0 0 4px">Class</label><select id="aClass" style="max-width:160px">${classOptions.map(c=>`<option ${c===cls?'selected':''}>${c}</option>`).join('')}</select></div>
@@ -380,7 +646,7 @@ async function loadAttendance() {
   ${canMark ? '<button id="aAll">Mark all Present</button> <button id="aSave">Save Attendance</button>' : ''}
   ${isTeacher ? '' : '<button id="expAtt" class="secondary">Export Attendance CSV</button>'}</div>
   <p id="aCount">${list.length} students in this class${canMark ? '' : ' — read-only view (neeche sirf saved attendance dikh rahi hai, mark karne ka option nahi hai)'}</p>
-  <table id="aTable"><tr><th>Name</th><th>Class</th><th>Status</th></tr>${list.map(s=>`<tr><td>${esc(s.name)}</td><td>${esc(s.class_name)}</td><td>${statusCell(s)}</td></tr>`).join('')}</table></div>`;
+  <table id="aTable"><tr><th>Name</th><th>Class</th><th>Status</th></tr>${list.map(s=>`<tr><td>${esc(s.name)}</td><td>${esc(s.class_name)}</td><td>${statusCell(s)}</td></tr>`).join('')}</table></div>${isTeacher ? '' : '<div id="lateSummary"></div>'}`;
   $('#aClass').onchange = e => { stuFilter.class = e.target.value; loadAttendance(); };
   // Name search filters the loaded rows in place (saved Present/Absent choices stay).
   $('#aSearch').oninput = () => {
@@ -417,6 +683,23 @@ async function loadAttendance() {
       box.innerHTML = `<p style="font-size:13px;color:var(--muted)">Is class ki 1st period ${esc(perm.period1TeacherName || '—')} ki hai (${esc(perm.subject || '')}, Period 1). Admin kisi bhi class ki attendance laga sakta hai — teacher ko sirf apni 1st period wali class ki attendance lagane ka option dikhta hai.</p>`;
     }
   }
+  translateDom($('#view'));
+  if (!isTeacher) loadLateSummary();
+}
+// Late summary (admin only, Attendance tab): kis student ki is mahine
+// mein late count kitni hai, aur parent ko notification gaya ya nahi
+// (4+ late = notification gaya, us ke baad har late par phir gaya).
+async function loadLateSummary() {
+  const box = $('#lateSummary'); if (!box) return;
+  const month = $('#monthInput').value;
+  try {
+    const rows = await api('/api/attendance/late-counts?month=' + month);
+    if (!rows.length) { box.innerHTML = `<div class="card" style="margin-top:14px"><h3>⏰ Late this month (${month})</h3><p>Is mahine mein koi student late nahi aaya.</p></div>`; return; }
+    box.innerHTML = `<div class="card" style="margin-top:14px"><h3>⏰ Late this month (${month}) — ${rows.length} student(s)</h3>
+    <p style="font-size:13px;color:var(--muted)">3 se zyada dafa late hone par (4th late se) parent ko notification jata hai, aur us ke baad har late par phir notification jata hai. Late bhi present mein shamil hota hai.</p>
+    <table><tr><th>Student</th><th>Class</th><th>Late days</th><th>Last late</th><th>Parent notified?</th></tr>
+    ${rows.map(r => `<tr><td>${esc(r.name)}</td><td>${esc(r.class_name)}</td><td><b>${r.lateCount}</b></td><td>${esc(r.lastLate || '—')}</td><td>${r.lateCount >= 4 ? '<span class="badge pending">Yes — ' + r.lateCount + ' times</span>' : '<span class="badge">Not yet (needs 4)</span>'}</td></tr>`).join('')}</table></div>`;
+  } catch (e) { box.innerHTML = ''; }
 }
 
 // ---- Staff Attendance (separate tab — NOT student attendance) ----
@@ -454,6 +737,7 @@ async function loadStaffAttendance() {
       alert('Staff attendance saved (' + records.length + ' records). Dashboard par “Staff Present Today” update ho gaya hai.');
     } catch (e) { alert(e.message); }
   };
+  translateDom($('#view'));
 }
 
 // ---- Fees (admin only) ----
@@ -479,6 +763,7 @@ async function loadFees() {
   $('#feeClear').onclick = () => { feeFilter = { search: '', class: '' }; loadFees(); };
   $('#genFees').onclick = async () => { const r = await api('/api/fees/generate', { method: 'POST', body: JSON.stringify({ month }) }); alert('Created ' + r.created + ' new challans.'); loadFees(); };
   $('#expFees').onclick = () => downloadFile('/api/export/fees?month=' + month, 'fees-' + month + '.csv').catch(e => alert(e.message));
+  translateDom($('#view'));
 }
 window.payFee = async (id, remaining) => {
   const amt = +prompt('Payment amount (Rs)?', remaining); if (!amt) return;
@@ -488,15 +773,16 @@ window.payFee = async (id, remaining) => {
 };
 
 // ---- Results ----
-let resFilter = { search: '', class: '' };
+let resFilter = { search: '', class: '', exam: 'Mid Term 2026' };
 async function loadResults() {
   if (me.role === 'parent') { $('#view').innerHTML = '<div class="card"><h3>Results</h3><p>Apne bachay ka result Dashboard / My Child se dekhein.</p></div>'; return; }
-  const rows = await api('/api/results?' + new URLSearchParams({ exam: 'Mid Term 2026', search: resFilter.search, class: resFilter.class }));
+  const rows = await api('/api/results?' + new URLSearchParams({ exam: resFilter.exam, search: resFilter.search, class: resFilter.class }));
   const byStudent = {};
   rows.forEach(r => { (byStudent[r.student_id] = byStudent[r.student_id] || { name: r.name, cls: r.class_name, marks: 0, total: 0 }); byStudent[r.student_id].marks += r.marks; byStudent[r.student_id].total += r.total_marks; });
   const list = Object.values(byStudent).map(s => ({ ...s, pct: (s.marks / s.total * 100).toFixed(1) })).sort((a,b)=>b.pct-a.pct);
-  $('#view').innerHTML = `<div class="card"><h3>Results — Mid Term 2026${me.role === 'teacher' ? ' (my subjects only)' : ''}</h3><p>Auto total / percentage / grade from server results.</p>
+  $('#view').innerHTML = `<div class="card"><h3>${esc(t('tabResults'))} — ${esc(resFilter.exam)}${me.role === 'teacher' ? ' (my subjects only)' : ''}</h3><p>Auto total / percentage / grade from server results.</p>
   <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:10px">
+  <div><label style="margin:0 0 4px">Exam</label><select id="resExam" style="max-width:180px">${EXAM_OPTIONS.map(e => `<option ${e===resFilter.exam?'selected':''}>${e}</option>`).join('')}</select></div>
   <div><label style="margin:0 0 4px">Class</label><select id="resClass" style="max-width:160px"><option value="">All classes</option>${CLASSES.map(c => `<option ${c===resFilter.class?'selected':''}>${c}</option>`).join('')}</select></div>
   <div style="flex:1;min-width:200px"><label style="margin:0 0 4px">Search (naam / roll / subject)</label><input id="resSearch" placeholder="e.g. Sara, 01, Maths" value="${esc(resFilter.search)}"></div>
   <button id="resGo">Search</button><button id="resClear" class="secondary">Clear</button></div>
@@ -504,12 +790,13 @@ async function loadResults() {
   ${me.role === 'admin' ? '<button id="expRes" class="secondary">Export Results CSV</button>' : ''}</div>
   <table><tr><th>Student</th><th>Class</th><th>Total</th><th>%</th><th>Grade</th></tr>
   ${list.slice(0,120).map(s=>`<tr><td>${esc(s.name)}</td><td>${esc(s.cls)}</td><td>${s.marks}/${s.total}</td><td>${s.pct}%</td><td>${s.pct>=90?'A+':s.pct>=80?'A':s.pct>=70?'B':s.pct>=60?'C':s.pct>=50?'D':'F'}</td></tr>`).join('')}</table><p>Showing top 120 of ${list.length} students.</p></div>`;
-  const expBtn = $('#expRes'); if (expBtn) expBtn.onclick = () => downloadFile('/api/export/results?exam=Mid Term 2026', 'results.csv').catch(e => alert(e.message));
-  const resDoSearch = () => { resFilter.class = $('#resClass').value; resFilter.search = ($('#resSearch').value || '').trim(); loadResults(); };
+  const expBtn = $('#expRes'); if (expBtn) expBtn.onclick = () => downloadFile('/api/export/results?exam=' + encodeURIComponent(resFilter.exam), 'results.csv').catch(e => alert(e.message));
+  const resDoSearch = () => { resFilter.exam = $('#resExam').value; resFilter.class = $('#resClass').value; resFilter.search = ($('#resSearch').value || '').trim(); loadResults(); };
   $('#resGo').onclick = resDoSearch;
   $('#resSearch').onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); resDoSearch(); } };
-  $('#resClear').onclick = () => { resFilter = { search: '', class: '' }; loadResults(); };
+  $('#resClear').onclick = () => { resFilter = { search: '', class: '', exam: 'Mid Term 2026' }; loadResults(); };
   $('#addRes').onclick = () => resultForm();
+  translateDom($('#view'));
 }
 // ---- Add Result form: pick student (search by name / roll / class), exam, subject, marks ----
 let resultStudents = [], resultTeacherAssign = [];
@@ -524,7 +811,8 @@ async function resultForm() {
   <label>Student</label><select id="r_student"></select>
   <label>Class (kis class ka result hai?)</label><select id="r_class">${CLASSES.map(c => `<option>${c}</option>`).join('')}</select>
   <p style="font-size:13px;color:var(--muted)">Default: student ki current class. Purani class ka result add karna ho to yahan woh class chunein — woh result student ki profile mein “Previous Class Results” mein dikhega.</p>
-  <label>Exam</label><input id="r_exam" value="Mid Term 2026" list="r_exams"><datalist id="r_exams"><option>Mid Term 2026</option><option>Final Term 2026</option><option>Annual Exam 2025</option><option>Monthly Test</option></datalist>
+  <label>Exam</label><select id="r_exam">${EXAM_OPTIONS.map(e => `<option ${e === 'Mid Term 2026' ? 'selected' : ''}>${e}</option>`).join('')}</select>
+  <p style="font-size:13px;color:var(--muted)">Exam sirf in teen mein se chunein — 1st Term, Mid Term ya Final Term. Free text nahi hai.</p>
   <label>Subject</label><select id="r_subject"></select>
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
     <div><label>Marks obtained</label><input id="r_marks" type="number" min="0" value="70"></div>
@@ -584,6 +872,7 @@ async function loadTeachers() {
   const tSearch = $('#tSearch'); if (tSearch) tSearch.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); teacherSearch = (tSearch.value || '').trim(); loadTeachers(); } };
   const tClear = $('#tClear'); if (tClear) tClear.onclick = () => { teacherSearch = ''; loadTeachers(); };
   const addBtn = $('#addTeacher'); if (addBtn) addBtn.onclick = () => teacherForm();
+  translateDom($('#view'));
 }
 // ---- Add / Edit Teacher / Staff form (admin only) — full-info form ----
 // Fields: full name, father name, CNIC / ID card, date of birth, phone,
@@ -828,6 +1117,7 @@ async function loadTimetable() {
       } catch (e) { $('#epMsg').textContent = e.message; }
     };
   }
+  translateDom($('#view'));
 }
 
 // ---- Click-to-edit a timetable period (admin only) ----
@@ -946,6 +1236,7 @@ async function loadLeaving() {
   $('#lvGo').onclick = lvDoSearch;
   $('#lvSearch').onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); lvDoSearch(); } };
   $('#lvClear').onclick = () => { leavingSearch = ''; loadLeaving(); };
+  translateDom($('#view'));
 }
 
 // ---- Backup & Export (admin only) ----
@@ -974,9 +1265,11 @@ async function loadBackup() {
   $('#expFees2').onclick = () => downloadFile('/api/export/fees?month=' + month, 'fees-' + month + '.csv').catch(e => alert(e.message));
   $('#expRes2').onclick = () => downloadFile('/api/export/results?exam=Mid Term 2026', 'results.csv').catch(e => alert(e.message));
   $('#expAtt2').onclick = () => downloadFile('/api/export/attendance?date=' + date, 'attendance-' + date + '.csv').catch(e => alert(e.message));
+  translateDom($('#view'));
 }
-function openModal(html) { $('#modalBody').innerHTML = html; $('#modal').classList.remove('hidden'); }
+function openModal(html) { $('#modalBody').innerHTML = html; $('#modal').classList.remove('hidden'); translateDom($('#modalBody')); }
 function closeModal() { $('#modal').classList.add('hidden'); }
 window.closeModal = closeModal;
 $('#modal').onclick = e => { if (e.target.id === 'modal') closeModal(); };
+applyStaticLang();
 checkLogin();

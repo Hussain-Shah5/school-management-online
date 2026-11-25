@@ -2,36 +2,37 @@
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>School Management System — Online</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:wght@600;700&family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:wght@600;700&family=Inter:wght@400;600;700;800&family=Noto+Nastaliq+Urdu:wght@400;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="style.css"></head>
 <body>
 <div id="loginView" class="login-page"><div class="login-wrap">
   <div class="login-brand">
+    <div class="lang-toggle" style="position:absolute;top:12px;right:12px"><button type="button" data-lang="en" class="active">English</button><button type="button" data-lang="ur">اردو</button></div>
     <div class="brand-mark">🏫</div>
-    <h2>School Management System</h2>
-    <p>Attendance • Fees • Results • Teachers — sab ek jagah.</p>
+    <h2 data-i18n="appTitle">School Management System</h2>
+    <p data-i18n="loginSub">Attendance • Fees • Results • Teachers — sab ek jagah.</p>
   </div>
   <div class="login-body">
-  <p>School login — apna role chunein, phir login karein.</p>
-  <label>I am logging in as</label>
+  <p data-i18n="loginLine">School login — apna role chunein, phir login karein.</p>
+  <label data-i18n="iamRole">I am logging in as</label>
   <div id="rolePick" style="display:flex;gap:6px;margin-bottom:6px">
-    <button type="button" data-role="admin" class="role-btn active">Admin</button>
-    <button type="button" data-role="teacher" class="role-btn secondary">Teacher</button>
-    <button type="button" data-role="parent" class="role-btn secondary">Parent</button>
+    <button type="button" data-role="admin" class="role-btn active" data-i18n="adminRole">Admin</button>
+    <button type="button" data-role="teacher" class="role-btn secondary" data-i18n="teacherRole">Teacher</button>
+    <button type="button" data-role="parent" class="role-btn secondary" data-i18n="parentRole">Parent</button>
   </div>
   <div class="demo-box" id="demoBox"></div>
   <div id="adminFields">
-    <label>School name (register ke liye)</label><input id="schoolName" placeholder="Demo School">
+    <label data-i18n="schoolNameLbl">School name (register ke liye)</label><input id="schoolName" placeholder="Demo School">
   </div>
   <div id="parentFields" class="hidden">
-    <label>Parent phone (bachay ke record wala number)</label><input id="parentPhone" placeholder="e.g. 0314941079">
-    <label>Student roll no</label><input id="parentRoll" placeholder="e.g. 01">
-    <label>Student class</label><select id="parentClass"><option>Nursery</option><option>KG</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option><option>9</option><option>10</option></select>
+    <label data-i18n="parentPhoneLbl">Parent phone (bachay ke record wala number)</label><input id="parentPhone" placeholder="e.g. 0314941079">
+    <label data-i18n="studentRollLbl">Student roll no</label><input id="parentRoll" placeholder="e.g. 01">
+    <label data-i18n="studentClassLbl">Student class</label><select id="parentClass"><option>Nursery</option><option>KG</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option><option>9</option><option>10</option></select>
     <p style="font-size:13px;color:#64748b">Parent account banane ke liye phone + roll no + class wohi honi chahiye jo school ke record mein hai. Demo parent: username <code>parent1</code>, password <code>parent123</code> — bacha Sara Qureshi, Nursery.</p>
   </div>
-  <label>Username</label><input id="username" value="admin" autocomplete="username">
-  <label>Password</label><input id="password" type="password" value="admin123" autocomplete="current-password">
-  <div style="display:flex;gap:8px;margin-top:14px"><button id="loginBtn" style="flex:1">Login</button><button id="registerBtn" class="secondary" style="flex:1">Create Account</button></div>
+  <label data-i18n="usernameLbl">Username</label><input id="username" value="admin" autocomplete="username">
+  <label data-i18n="passwordLbl">Password</label><input id="password" type="password" value="admin123" autocomplete="current-password">
+  <div style="display:flex;gap:8px;margin-top:14px"><button id="loginBtn" style="flex:1" data-i18n="loginBtn">Login</button><button id="registerBtn" class="secondary" style="flex:1" data-i18n="createAccountBtn">Create Account</button></div>
   <p id="loginMsg" style="color:#b91c1c"></p>
   <p style="font-size:13px;color:#64748b">Data server-side SQLite database mein save hota hai — browser band karne par bhi data rehta hai. Teacher sirf apni classes dekh sakta hai, parent sirf apna bacha — fees aur salaries sirf admin dekh sakta hai.</p>
   </div>
@@ -39,17 +40,20 @@
 
 <div id="appView" class="hidden">
 <header><div><h1>🏫 <span id="schoolTitle">School Management System</span></h1><small id="userLine"></small></div>
-<div><button id="logoutBtn" class="secondary">Logout</button></div></header>
+<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+<div class="lang-toggle"><button type="button" data-lang="en" class="active">English</button><button type="button" data-lang="ur">اردو</button></div>
+<button id="notifBell" class="secondary hidden" title="Notifications">🔔 <span id="notifCount" class="notif-badge hidden"></span></button>
+<button id="logoutBtn" class="secondary" data-i18n="logoutBtn">Logout</button></div></header>
 <div class="container">
   <div class="hero">
     <span class="hero-eyebrow"><span class="pulse-dot"></span> Live today &nbsp;•&nbsp; <span id="heroDate">25 November 2026</span></span>
     <h2 id="heroTitle">School Management System</h2>
-    <p>Attendance, fees, results aur teachers — poora school, ek dashboard par.</p>
+    <p data-i18n="heroSub">Attendance, fees, results aur teachers — poora school, ek dashboard par.</p>
   </div>
   <div class="toolbar">
-    <label style="margin:0">Date <input type="date" id="todayInput" value="2026-11-25" style="width:auto"></label>
-    <label style="margin:0">Month <input type="month" id="monthInput" value="2026-11" style="width:auto"></label>
-    <button id="refreshBtn" class="secondary">Refresh</button>
+    <label style="margin:0"><span data-i18n="dateLbl">Date</span> <input type="date" id="todayInput" value="2026-11-25" style="width:auto"></label>
+    <label style="margin:0"><span data-i18n="monthLbl">Month</span> <input type="month" id="monthInput" value="2026-11" style="width:auto"></label>
+    <button id="refreshBtn" class="secondary" data-i18n="refreshBtn">Refresh</button>
   </div>
   <div class="cards" id="dashCards"></div>
   <div class="tabs" id="tabs"></div>
