@@ -25,6 +25,9 @@ CREATE TABLE IF NOT EXISTS users (
   password_hash TEXT NOT NULL,
   salt TEXT NOT NULL,
   school_name TEXT NOT NULL DEFAULT 'Demo School',
+  role TEXT NOT NULL DEFAULT 'admin',
+  teacher_id INTEGER,
+  student_id INTEGER,
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS students (
@@ -112,6 +115,103 @@ function grade(pct) {
   if (pct >= 60) return 'C'; if (pct >= 50) return 'D'; return 'F';
 }
 
+// ---------- roles, CSV, backup helpers ----------
+// Existing databases (already deployed on Railway) have a users table
+// without role/teacher_id/student_id — add the columns on startup.
+function ensureUserColumns() {
+  const cols = db.prepare("PRAGMA table_info(users)").all().map(c => c.name);
+  if (!cols.includes('role')) db.exec("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'");
+  if (!cols.includes('teacher_id')) db.exec('ALTER TABLE users ADD COLUMN teacher_id INTEGER');
+  if (!cols.includes('student_id')) db.exec('ALTER TABLE users ADD COLUMN student_id INTEGER');
+}
+function createUser(username, password, schoolName, role, teacherId, studentId) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  try {
+    const r = db.prepare('INSERT INTO users (username,password_hash,salt,school_name,role,teacher_id,student_id,created_at) VALUES (?,?,?,?,?,?,?,?)')
+      .run(username, hashPassword(password, salt), salt, schoolName || 'Demo School', role || 'admin', teacherId || null, studentId || null, new Date().toISOString().slice(0, 10));
+    return Number(r.lastInsertRowid);
+  } catch (e) { return null; } // username already exists — keep the existing account
+}
+function teacherUsername(name) {
+  if (name === 'Muhammad Asif') return 'asif'; // known by his second name
+  return name.split(' ')[0].toLowerCase();
+}
+// Demo parent accounts: parent1..parent5, each linked to the first active
+// student (lowest roll no) in Nursery, 1, 5, 8, 10. Password: parent123.
+const PARENT_DEMO_CLASSES = ['Nursery', '1', '5', '8', '10'];
+function ensureRoleAccounts() {
+  ensureUserColumns();
+  db.prepare("UPDATE users SET role='admin' WHERE username='admin' AND (role IS NULL OR role='')").run();
+  const teachers = db.prepare('SELECT id, name FROM teachers ORDER BY id').all();
+  for (const t of teachers) {
+    const uname = teacherUsername(t.name);
+    const existing = db.prepare('SELECT id FROM users WHERE username=?').get(uname);
+    if (!existing) createUser(uname, 'teacher123', 'Demo School', 'teacher', t.id, null);
+    else db.prepare('UPDATE users SET role=?, teacher_id=? WHERE id=?').run('teacher', t.id, existing.id);
+  }
+  PARENT_DEMO_CLASSES.forEach((cls, i) => {
+    const st = db.prepare("SELECT id FROM students WHERE status='active' AND class_name=? ORDER BY CAST(roll_no AS INTEGER) LIMIT 1").get(cls);
+    if (!st) return;
+    const uname = 'parent' + (i + 1);
+    const existing = db.prepare('SELECT id FROM users WHERE username=?').get(uname);
+    if (!existing) createUser(uname, 'parent123', 'Demo School', 'parent', null, st.id);
+    else db.prepare('UPDATE users SET role=?, student_id=? WHERE id=?').run('parent', st.id, existing.id);
+  });
+}
+function setSession(req, u) {
+  req.session.userId = u.id; req.session.username = u.username;
+  req.session.role = u.role || 'admin';
+  req.session.teacherId = u.teacher_id || null;
+  req.session.studentId = u.student_id || null;
+}
+function teacherClasses(req) {
+  if (!req.session.teacherId) return [];
+  return db.prepare('SELECT DISTINCT class_name FROM teacher_assignments WHERE teacher_id=?').all(req.session.teacherId).map(r => r.class_name);
+}
+function requireRole(...roles) {
+  return (req, res, next) => {
+    if (!req.session || !req.session.userId) return res.status(401).json({ error: 'Login required' });
+    if (!roles.includes(req.session.role || 'admin')) return res.status(403).json({ error: 'Only ' + roles.join(' or ') + ' can do this' });
+    next();
+  };
+}
+const requireAdmin = requireRole('admin');
+function csvCell(v) {
+  const str = String(v ?? '');
+  return /[",\n\r]/.test(str) ? '"' + str.replace(/"/g, '""') + '"' : str;
+}
+function sendCsv(res, filename, columns, rows) {
+  const lines = [columns.map(csvCell).join(',')];
+  for (const r of rows) lines.push(r.map(csvCell).join(','));
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="' + filename + '"');
+  res.send('\uFEFF' + lines.join('\r\n'));
+}
+function studentProfile(id) {
+  const st = db.prepare('SELECT * FROM students WHERE id=?').get(id);
+  if (!st) return null;
+  st.attendance = db.prepare('SELECT * FROM attendance WHERE student_id=? ORDER BY date DESC LIMIT 60').all(id);
+  st.fees = db.prepare('SELECT * FROM fees WHERE student_id=? ORDER BY month').all(id);
+  st.results = db.prepare('SELECT * FROM results WHERE student_id=? ORDER BY exam, subject').all(id);
+  st.promotions = db.prepare('SELECT * FROM promotions WHERE student_id=? ORDER BY date DESC').all(id);
+  st.leaving = db.prepare('SELECT * FROM leaving_records WHERE student_id=?').get(id) || null;
+  return st;
+}
+function teacherProfile(id) {
+  const t = db.prepare('SELECT * FROM teachers WHERE id=?').get(id);
+  if (!t) return null;
+  const assignments = db.prepare('SELECT * FROM teacher_assignments WHERE teacher_id=?').all(id);
+  const progress = assignments.map(a => {
+    const row = db.prepare("SELECT AVG(CAST(r.marks AS REAL)/r.total_marks*100) avg, COUNT(*) n FROM results r JOIN students s ON s.id=r.student_id WHERE r.exam='Mid Term 2026' AND r.subject=? AND s.class_name=? AND s.status='active'").get(a.subject, a.class_name);
+    const top = db.prepare("SELECT s.name, CAST(r.marks AS REAL)/r.total_marks*100 pct FROM results r JOIN students s ON s.id=r.student_id WHERE r.exam='Mid Term 2026' AND r.subject=? AND s.class_name=? AND s.status='active' ORDER BY pct DESC LIMIT 3").all(a.subject, a.class_name);
+    return { ...a, avg: row && row.avg ? Math.round(row.avg * 10) / 10 : 0, students: row ? row.n : 0, top };
+  });
+  const staffAtt = db.prepare('SELECT * FROM staff_attendance WHERE teacher_id=? ORDER BY date DESC LIMIT 30').all(id);
+  const attPct = staffAtt.length ? Math.round(staffAtt.filter(a => a.status === 'Present').length / staffAtt.length * 1000) / 10 : 0;
+  const timetable = db.prepare('SELECT * FROM timetable WHERE teacher_id=? ORDER BY day, period').all(id);
+  return { ...t, assignments, progress, staffAtt, attPct, timetable };
+}
+
 // ---------- seed (runs once, only when DB is empty) ----------
 function seed() {
   if (db.prepare('SELECT COUNT(*) c FROM students').get().c > 0) return;
@@ -121,8 +221,8 @@ function seed() {
   const pick = (arr) => arr[Math.floor(rnd() * arr.length)];
   // admin user
   const salt = crypto.randomBytes(16).toString('hex');
-  db.prepare('INSERT INTO users (username,password_hash,salt,school_name,created_at) VALUES (?,?,?,?,?)')
-    .run('admin', hashPassword('admin123', salt), salt, 'Demo School', '2026-04-01');
+  db.prepare('INSERT INTO users (username,password_hash,salt,school_name,role,created_at) VALUES (?,?,?,?,?,?)')
+    .run('admin', hashPassword('admin123', salt), salt, 'Demo School', 'admin', '2026-04-01');
   const firstM = ['Ahmed', 'Ali', 'Bilal', 'Hassan', 'Usman', 'Hamza', 'Omar', 'Zain', 'Danish', 'Saad', 'Fahad', 'Arslan', 'Taha', 'Rayyan', 'Ibrahim', 'Mustafa', 'Abdullah', 'Ayan'];
   const firstF = ['Ayesha', 'Fatima', 'Zainab', 'Maryam', 'Hira', 'Sara', 'Mahnoor', 'Amna', 'Iqra', 'Laiba', 'Noor', 'Khadija', 'Hafsa', 'Amina', 'Sana', 'Rania'];
   const last = ['Khan', 'Ali', 'Ahmed', 'Malik', 'Hussain', 'Shah', 'Raza', 'Butt', 'Chaudhry', 'Sheikh', 'Mirza', 'Qureshi', 'Siddiqui', 'Akhtar', 'Nawaz', 'Iqbal'];
@@ -294,6 +394,7 @@ function seed() {
   console.log('Seed complete: students=' + studentIds.length + ', active=' + active.length + ', teachers=' + teacherIds.length);
 }
 seed();
+ensureRoleAccounts();
 
 // ---------- app ----------
 const app = express();
@@ -311,36 +412,86 @@ const requireAuth = (req, res, next) => {
   res.status(401).json({ error: 'Login required' });
 };
 
-// auth
+// auth (roles: admin / teacher / parent — server decides the role from the account, never from the client)
 app.post('/api/register', (req, res) => {
-  const { username, password, schoolName } = req.body || {};
-  if (!username || !password || password.length < 4) return res.status(400).json({ error: 'Username and password (min 4 chars) required' });
-  const salt = crypto.randomBytes(16).toString('hex');
-  try {
-    const r = db.prepare('INSERT INTO users (username,password_hash,salt,school_name,created_at) VALUES (?,?,?,?,?)')
-      .run(username, hashPassword(password, salt), salt, schoolName || 'My School', new Date().toISOString().slice(0, 10));
-    req.session.userId = Number(r.lastInsertRowid); req.session.username = username;
-    res.json({ ok: true, username, schoolName: schoolName || 'My School' });
-  } catch (e) { res.status(400).json({ error: 'Username already exists' }); }
+  const { username, password, schoolName, role, phone, rollNo, className } = req.body || {};
+  const wantRole = role || 'admin';
+  if (!password || password.length < 4) return res.status(400).json({ error: 'Password (min 4 chars) required' });
+  if (wantRole === 'teacher') return res.status(403).json({ error: 'Teacher accounts are created by admin. Demo teacher login: e.g. ahmed / teacher123' });
+  if (wantRole === 'parent') {
+    if (!phone || !rollNo || !className) return res.status(400).json({ error: 'Parent registration needs parent phone, student roll no and class' });
+    const st = db.prepare("SELECT * FROM students WHERE phone=? AND roll_no=? AND class_name=? AND status='active'").get(String(phone).trim(), String(rollNo).trim(), className);
+    if (!st) return res.status(400).json({ error: 'No active student found with that phone, roll no and class. Check the details with the school office.' });
+    const uname = (username || String(phone).trim());
+    const id = createUser(uname, password, schoolName || 'Demo School', 'parent', null, st.id);
+    if (!id) return res.status(400).json({ error: 'Username already exists — try another username' });
+    const u = db.prepare('SELECT * FROM users WHERE id=?').get(id);
+    setSession(req, u);
+    return res.json({ ok: true, username: u.username, schoolName: u.school_name, role: 'parent', studentId: st.id, studentName: st.name });
+  }
+  if (!username) return res.status(400).json({ error: 'Username required' });
+  const id = createUser(username, password, schoolName || 'My School', 'admin', null, null);
+  if (!id) return res.status(400).json({ error: 'Username already exists' });
+  const u = db.prepare('SELECT * FROM users WHERE id=?').get(id);
+  setSession(req, u);
+  res.json({ ok: true, username: u.username, schoolName: u.school_name, role: 'admin' });
 });
 app.post('/api/login', (req, res) => {
   const { username, password } = req.body || {};
   const u = db.prepare('SELECT * FROM users WHERE username=?').get(username);
   if (!u || hashPassword(password || '', u.salt) !== u.password_hash) return res.status(401).json({ error: 'Wrong username or password' });
-  req.session.userId = u.id; req.session.username = u.username;
-  res.json({ ok: true, username: u.username, schoolName: u.school_name });
+  setSession(req, u);
+  res.json({ ok: true, username: u.username, schoolName: u.school_name, role: u.role || 'admin', teacherId: u.teacher_id || null, studentId: u.student_id || null });
 });
 app.post('/api/logout', (req, res) => { req.session.destroy(() => res.json({ ok: true })); });
 app.get('/api/me', (req, res) => {
   if (!req.session.userId) return res.json({ loggedIn: false });
-  const u = db.prepare('SELECT username, school_name FROM users WHERE id=?').get(req.session.userId);
-  res.json({ loggedIn: true, username: u.username, schoolName: u.school_name });
+  const u = db.prepare('SELECT username, school_name, role, teacher_id, student_id FROM users WHERE id=?').get(req.session.userId);
+  if (!u) return res.json({ loggedIn: false });
+  res.json({ loggedIn: true, username: u.username, schoolName: u.school_name, role: u.role || 'admin', teacherId: u.teacher_id || null, studentId: u.student_id || null });
+});
+// scoped self endpoints (no other student's / teacher's data)
+app.get('/api/my-child', requireRole('parent'), (req, res) => {
+  if (!req.session.studentId) return res.status(403).json({ error: 'No child linked to this parent account' });
+  const prof = studentProfile(req.session.studentId);
+  if (!prof) return res.status(404).json({ error: 'Child not found' });
+  res.json(prof);
+});
+app.get('/api/my-teacher', requireRole('teacher'), (req, res) => {
+  if (!req.session.teacherId) return res.status(403).json({ error: 'No teacher linked to this account' });
+  const prof = teacherProfile(req.session.teacherId);
+  if (!prof) return res.status(404).json({ error: 'Teacher not found' });
+  delete prof.salary; // teachers never see salaries, even their own, in the UI
+  res.json(prof);
 });
 
-// dashboard
+// dashboard (scoped by role — teachers never get fees/salaries, parents only get their child)
 app.get('/api/dashboard', requireAuth, (req, res) => {
   const today = req.query.today || '2026-11-25';
   const month = req.query.month || '2026-11';
+  const role = req.session.role || 'admin';
+  if (role === 'teacher') {
+    const my = teacherClasses(req);
+    const myAssign = db.prepare('SELECT * FROM teacher_assignments WHERE teacher_id=?').all(req.session.teacherId);
+    const myStudents = my.length ? db.prepare("SELECT COUNT(*) c FROM students WHERE status='active' AND class_name IN (" + my.map(() => '?').join(',') + ')').get(...my).c : 0;
+    const att = my.length ? db.prepare('SELECT status, COUNT(*) c FROM attendance WHERE date=? AND class_name IN (' + my.map(() => '?').join(',') + ') GROUP BY status').all(today, ...my) : [];
+    const present = (att.find(a => a.status === 'Present') || { c: 0 }).c;
+    const prof = teacherProfile(req.session.teacherId);
+    const staffAtt = db.prepare('SELECT * FROM staff_attendance WHERE teacher_id=? ORDER BY date DESC LIMIT 30').all(req.session.teacherId);
+    const attPct = staffAtt.length ? Math.round(staffAtt.filter(a => a.status === 'Present').length / staffAtt.length * 1000) / 10 : 0;
+    return res.json({ role, today, month, myClasses: my, mySubjects: [...new Set(myAssign.map(a => a.subject))], myStudents, present, attendance: att, progress: prof ? prof.progress : [], attPct, teacherName: prof ? prof.name : '' });
+  }
+  if (role === 'parent') {
+    const prof = studentProfile(req.session.studentId);
+    if (!prof) return res.status(404).json({ error: 'Child not found' });
+    const attTotal = prof.attendance.length;
+    const attPresent = prof.attendance.filter(a => a.status === 'Present').length;
+    const feesTotal = prof.fees.reduce((a, f) => a + f.amount, 0);
+    const feesPaid = prof.fees.reduce((a, f) => a + f.paid, 0);
+    const totalMarks = prof.results.reduce((a, r) => a + r.marks, 0), totalOf = prof.results.reduce((a, r) => a + r.total_marks, 0);
+    const pct = totalOf ? Math.round(totalMarks / totalOf * 1000) / 10 : 0;
+    return res.json({ role, today, month, child: { id: prof.id, name: prof.name, class_name: prof.class_name, section: prof.section, roll_no: prof.roll_no, father_name: prof.father_name }, attPct: attTotal ? Math.round(attPresent / attTotal * 1000) / 10 : 0, attTotal, attPresent, feesTotal, feesPaid, feesPending: feesTotal - feesPaid, resultPct: pct, grade: grade(pct) });
+  }
   const total = db.prepare("SELECT COUNT(*) c FROM students WHERE status='active'").get().c;
   const totalAll = db.prepare('SELECT COUNT(*) c FROM students').get().c;
   const att = db.prepare('SELECT status, COUNT(*) c FROM attendance WHERE date=? GROUP BY status').all(today);
@@ -352,48 +503,57 @@ app.get('/api/dashboard', requireAuth, (req, res) => {
   const left = db.prepare('SELECT COUNT(*) c FROM leaving_records').get().c;
   const promoted = db.prepare('SELECT COUNT(*) c FROM promotions').get().c;
   const byClass = db.prepare("SELECT class_name, COUNT(*) c FROM students WHERE status='active' GROUP BY class_name").all();
-  res.json({ total, totalAll, today, month, present, attendance: att, feesTotal: fees.total, feesCollected: fees.collected, feesPending: fees.total - fees.collected, feesPendingCount: pending, teachers, staffPresent, left, promoted, byClass });
+  res.json({ role, total, totalAll, today, month, present, attendance: att, feesTotal: fees.total, feesCollected: fees.collected, feesPending: fees.total - fees.collected, feesPendingCount: pending, teachers, staffPresent, left, promoted, byClass });
 });
 
 // students
 app.get('/api/students', requireAuth, (req, res) => {
   const { class: cls, search, status } = req.query;
+  const role = req.session.role || 'admin';
+  if (role === 'parent') {
+    if (!req.session.studentId) return res.status(403).json({ error: 'No child linked to this parent account' });
+    return res.json(db.prepare('SELECT * FROM students WHERE id=?').all(req.session.studentId));
+  }
   let sql = 'SELECT * FROM students WHERE 1=1'; const p = [];
   if (cls) { sql += ' AND class_name=?'; p.push(cls); }
   if (status) { sql += ' AND status=?'; p.push(status); }
   if (search) { sql += ' AND (name LIKE ? OR father_name LIKE ? OR roll_no LIKE ?)'; p.push(`%${search}%`, `%${search}%`, `%${search}%`); }
+  if (role === 'teacher') {
+    const my = teacherClasses(req);
+    if (!my.length) return res.json([]);
+    if (cls && !my.includes(cls)) return res.json([]);
+    sql += ' AND class_name IN (' + my.map(() => '?').join(',') + ')'; p.push(...my);
+  }
   sql += ' ORDER BY class_name, CAST(roll_no AS INTEGER)';
   res.json(db.prepare(sql).all(...p));
 });
 app.get('/api/classes', requireAuth, (req, res) => res.json(CLASSES));
-app.post('/api/students', requireAuth, (req, res) => {
+app.post('/api/students', requireAdmin, (req, res) => {
   const b = req.body || {};
   if (!b.name || !b.class_name) return res.status(400).json({ error: 'Name and class required' });
   const r = db.prepare('INSERT INTO students (name,father_name,class_name,section,roll_no,phone,monthly_fee,admission_date,status) VALUES (?,?,?,?,?,?,?,?,?)')
     .run(b.name, b.father_name || '', b.class_name, b.section || 'A', b.roll_no || '', b.phone || '', b.monthly_fee || 0, b.admission_date || '', 'active');
   res.json({ ok: true, id: Number(r.lastInsertRowid) });
 });
-app.put('/api/students/:id', requireAuth, (req, res) => {
+app.put('/api/students/:id', requireAdmin, (req, res) => {
   const b = req.body || {};
   db.prepare('UPDATE students SET name=?,father_name=?,class_name=?,section=?,roll_no=?,phone=?,monthly_fee=?,admission_date=? WHERE id=?')
     .run(b.name, b.father_name || '', b.class_name, b.section || 'A', b.roll_no || '', b.phone || '', b.monthly_fee || 0, b.admission_date || '', req.params.id);
   res.json({ ok: true });
 });
-app.delete('/api/students/:id', requireAuth, (req, res) => {
+app.delete('/api/students/:id', requireAdmin, (req, res) => {
   db.prepare('DELETE FROM students WHERE id=?').run(req.params.id);
   res.json({ ok: true });
 });
 app.get('/api/students/:id', requireAuth, (req, res) => {
   const s = db.prepare('SELECT * FROM students WHERE id=?').get(req.params.id);
   if (!s) return res.status(404).json({ error: 'Not found' });
-  const attendance = db.prepare('SELECT * FROM attendance WHERE student_id=? ORDER BY date DESC LIMIT 60').all(s.id);
-  const fees = db.prepare('SELECT * FROM fees WHERE student_id=? ORDER BY month').all(s.id);
-  const results = db.prepare('SELECT * FROM results WHERE student_id=? ORDER BY exam, subject').all(s.id);
-  const promotions = db.prepare('SELECT * FROM promotions WHERE student_id=? ORDER BY date DESC').all(s.id);
-  const leaving = db.prepare('SELECT * FROM leaving_records WHERE student_id=?').get(s.id);
-  res.json({ ...s, attendance, fees, results, promotions, leaving: leaving || null });
+  const role = req.session.role || 'admin';
+  if (role === 'parent' && Number(req.params.id) !== req.session.studentId) return res.status(403).json({ error: 'You can only see your own child' });
+  if (role === 'teacher' && !teacherClasses(req).includes(s.class_name)) return res.status(403).json({ error: 'This student is not in your classes' });
+  res.json(studentProfile(s.id));
 });
-app.post('/api/students/:id/leave', requireAuth, (req, res) => {
+app.post('/api/students/:id/leave', requireAdmin, (req, res) => {
   const b = req.body || {};
   db.prepare("UPDATE students SET status='left' WHERE id=?").run(req.params.id);
   const s = db.prepare('SELECT class_name FROM students WHERE id=?').get(req.params.id);
@@ -401,7 +561,7 @@ app.post('/api/students/:id/leave', requireAuth, (req, res) => {
     .run(req.params.id, b.leaving_date || new Date().toISOString().slice(0, 10), b.reason || '', s.class_name, b.slc_number || '');
   res.json({ ok: true });
 });
-app.post('/api/students/:id/promote', requireAuth, (req, res) => {
+app.post('/api/students/:id/promote', requireAdmin, (req, res) => {
   const b = req.body || {};
   const s = db.prepare('SELECT class_name FROM students WHERE id=?').get(req.params.id);
   db.prepare('INSERT INTO promotions (student_id,from_class,to_class,exam,percentage,date) VALUES (?,?,?,?,?,?)')
@@ -414,40 +574,58 @@ app.post('/api/students/:id/promote', requireAuth, (req, res) => {
 app.get('/api/attendance', requireAuth, (req, res) => {
   const { date, class: cls } = req.query;
   if (!date) return res.status(400).json({ error: 'date required (YYYY-MM-DD)' });
+  const role = req.session.role || 'admin';
   let sql = 'SELECT a.*, s.name FROM attendance a JOIN students s ON s.id=a.student_id WHERE a.date=?'; const p = [date];
+  if (role === 'parent') { sql += ' AND a.student_id=?'; p.push(req.session.studentId); }
+  else if (role === 'teacher') {
+    const my = teacherClasses(req);
+    if (cls && !my.includes(cls)) return res.status(403).json({ error: 'This class is not yours' });
+    if (!my.length) return res.json([]);
+    sql += ' AND a.class_name IN (' + my.map(() => '?').join(',') + ')'; p.push(...my);
+  }
   if (cls) { sql += ' AND a.class_name=?'; p.push(cls); }
   res.json(db.prepare(sql + ' ORDER BY a.class_name, s.name').all(...p));
 });
-app.post('/api/attendance', requireAuth, (req, res) => {
+app.post('/api/attendance', requireRole('admin', 'teacher'), (req, res) => {
   const { date, records } = req.body || {};
   if (!date || !Array.isArray(records)) return res.status(400).json({ error: 'date and records required' });
+  const my = (req.session.role || 'admin') === 'teacher' ? teacherClasses(req) : null;
   const ins = db.prepare('INSERT INTO attendance (student_id,date,status,class_name) VALUES (?,?,?,?) ON CONFLICT(student_id,date) DO UPDATE SET status=excluded.status');
   for (const r of records) {
     const s = db.prepare('SELECT class_name FROM students WHERE id=?').get(r.student_id);
-    if (s) ins.run(r.student_id, date, r.status, s.class_name);
+    if (!s) continue;
+    if (my && !my.includes(s.class_name)) return res.status(403).json({ error: 'You can only mark attendance for your own classes' });
+    ins.run(r.student_id, date, r.status, s.class_name);
   }
   res.json({ ok: true, saved: records.length });
 });
 app.get('/api/attendance/summary', requireAuth, (req, res) => {
   const { month, class: cls } = req.query;
   if (!month) return res.status(400).json({ error: 'month required (YYYY-MM)' });
-  const rows = db.prepare("SELECT student_id, COUNT(*) total, SUM(CASE WHEN status='Present' THEN 1 ELSE 0 END) present FROM attendance WHERE substr(date,1,7)=? GROUP BY student_id").all(month);
+  let rows = db.prepare("SELECT student_id, COUNT(*) total, SUM(CASE WHEN status='Present' THEN 1 ELSE 0 END) present FROM attendance WHERE substr(date,1,7)=? GROUP BY student_id").all(month);
+  const role = req.session.role || 'admin';
+  if (role === 'parent') rows = rows.filter(r => r.student_id === req.session.studentId);
+  if (role === 'teacher') {
+    const my = teacherClasses(req);
+    const ids = new Set(db.prepare("SELECT id FROM students WHERE class_name IN (" + my.map(() => '?').join(',') + ')').all(...my).map(x => x.id));
+    rows = rows.filter(r => ids.has(r.student_id));
+  }
   res.json(rows.map(r => ({ student_id: r.student_id, total: r.total, present: r.present, pct: r.total ? Math.round(r.present / r.total * 1000) / 10 : 0 })));
 });
 
 // fees
-app.get('/api/fees', requireAuth, (req, res) => {
+app.get('/api/fees', requireAdmin, (req, res) => {
   const month = req.query.month || '2026-11';
   res.json(db.prepare('SELECT f.*, s.name, s.class_name, s.father_name FROM fees f JOIN students s ON s.id=f.student_id WHERE f.month=? ORDER BY s.class_name, s.name').all(month));
 });
-app.post('/api/fees/generate', requireAuth, (req, res) => {
+app.post('/api/fees/generate', requireAdmin, (req, res) => {
   const month = (req.body || {}).month || '2026-11';
   const students = db.prepare('SELECT id, monthly_fee FROM students').all();
   const ins = db.prepare('INSERT OR IGNORE INTO fees (student_id,month,amount,paid,status) VALUES (?,?,?,0,?)');
   let n = 0; for (const s of students) { const r = ins.run(s.id, month, s.monthly_fee, 'pending'); if (r.changes) n++; }
   res.json({ ok: true, created: n, month });
 });
-app.post('/api/fees/:id/pay', requireAuth, (req, res) => {
+app.post('/api/fees/:id/pay', requireAdmin, (req, res) => {
   const { amount, method } = req.body || {};
   const f = db.prepare('SELECT * FROM fees WHERE id=?').get(req.params.id);
   if (!f) return res.status(404).json({ error: 'Not found' });
@@ -464,9 +642,16 @@ app.get('/api/results', requireAuth, (req, res) => {
   let sql = 'SELECT r.*, s.name, s.class_name FROM results r JOIN students s ON s.id=r.student_id WHERE 1=1'; const p = [];
   if (exam) { sql += ' AND r.exam=?'; p.push(exam); }
   if (cls) { sql += ' AND s.class_name=?'; p.push(cls); }
-  res.json(db.prepare(sql + ' ORDER BY s.class_name, s.name, r.subject').all(...p));
+  let rows = db.prepare(sql + ' ORDER BY s.class_name, s.name, r.subject').all(...p);
+  const role = req.session.role || 'admin';
+  if (role === 'parent') rows = rows.filter(r => r.student_id === req.session.studentId);
+  if (role === 'teacher') {
+    const allowed = new Set(db.prepare('SELECT class_name, subject FROM teacher_assignments WHERE teacher_id=?').all(req.session.teacherId).map(a => a.class_name + '|' + a.subject));
+    rows = rows.filter(r => allowed.has(r.class_name + '|' + r.subject));
+  }
+  res.json(rows);
 });
-app.post('/api/results', requireAuth, (req, res) => {
+app.post('/api/results', requireAdmin, (req, res) => {
   const b = req.body || {};
   if (!b.student_id || !b.exam || !b.subject) return res.status(400).json({ error: 'student, exam and subject required' });
   db.prepare('INSERT INTO results (student_id,exam,subject,marks,total_marks) VALUES (?,?,?,?,?) ON CONFLICT(student_id,exam,subject) DO UPDATE SET marks=excluded.marks, total_marks=excluded.total_marks')
@@ -476,13 +661,21 @@ app.post('/api/results', requireAuth, (req, res) => {
 
 // teachers & staff
 app.get('/api/teachers', requireAuth, (req, res) => {
+  const role = req.session.role || 'admin';
+  if (role === 'parent') return res.status(403).json({ error: 'Parents cannot see the teachers list' });
+  if (role === 'teacher') {
+    const t = db.prepare('SELECT * FROM teachers WHERE id=?').get(req.session.teacherId);
+    if (!t) return res.json([]);
+    delete t.salary;
+    return res.json([{ ...t, assignments: db.prepare('SELECT * FROM teacher_assignments WHERE teacher_id=?').all(t.id) }]);
+  }
   const teachers = db.prepare('SELECT * FROM teachers ORDER BY name').all();
   res.json(teachers.map(t => ({
     ...t,
     assignments: db.prepare('SELECT * FROM teacher_assignments WHERE teacher_id=?').all(t.id),
   })));
 });
-app.post('/api/teachers', requireAuth, (req, res) => {
+app.post('/api/teachers', requireAdmin, (req, res) => {
   const b = req.body || {};
   if (!b.name) return res.status(400).json({ error: 'Name required' });
   const r = db.prepare('INSERT INTO teachers (name,designation,qualification,salary,phone,subjects) VALUES (?,?,?,?,?,?)')
@@ -490,36 +683,25 @@ app.post('/api/teachers', requireAuth, (req, res) => {
   res.json({ ok: true, id: Number(r.lastInsertRowid) });
 });
 app.get('/api/teachers/:id', requireAuth, (req, res) => {
-  const t = db.prepare('SELECT * FROM teachers WHERE id=?').get(req.params.id);
-  if (!t) return res.status(404).json({ error: 'Not found' });
-  const assignments = db.prepare('SELECT * FROM teacher_assignments WHERE teacher_id=?').all(t.id);
-  // per-subject progress: average % of students in that class+subject from Mid Term 2026 results
-  const progress = assignments.map(a => {
-    const row = db.prepare(`SELECT AVG(CAST(r.marks AS REAL)/r.total_marks*100) avg, COUNT(*) n
-      FROM results r JOIN students s ON s.id=r.student_id
-      WHERE r.exam='Mid Term 2026' AND r.subject=? AND s.class_name=? AND s.status='active'`).get(a.subject, a.class_name);
-    const top = db.prepare(`SELECT s.name, CAST(r.marks AS REAL)/r.total_marks*100 pct
-      FROM results r JOIN students s ON s.id=r.student_id
-      WHERE r.exam='Mid Term 2026' AND r.subject=? AND s.class_name=? AND s.status='active'
-      ORDER BY pct DESC LIMIT 3`).all(a.subject, a.class_name);
-    return { ...a, avg: row && row.avg ? Math.round(row.avg * 10) / 10 : 0, students: row ? row.n : 0, top };
-  });
-  const staffAtt = db.prepare('SELECT * FROM staff_attendance WHERE teacher_id=? ORDER BY date DESC LIMIT 30').all(t.id);
-  const attPct = staffAtt.length ? Math.round(staffAtt.filter(a => a.status === 'Present').length / staffAtt.length * 1000) / 10 : 0;
-  const timetable = db.prepare('SELECT * FROM timetable WHERE teacher_id=? ORDER BY day, period').all(t.id);
-  res.json({ ...t, assignments, progress, staffAtt, attPct, timetable });
+  const role = req.session.role || 'admin';
+  if (role === 'parent') return res.status(403).json({ error: 'Parents cannot see teacher profiles' });
+  if (role === 'teacher' && Number(req.params.id) !== req.session.teacherId) return res.status(403).json({ error: 'You can only see your own profile' });
+  const prof = teacherProfile(Number(req.params.id));
+  if (!prof) return res.status(404).json({ error: 'Not found' });
+  if (role !== 'admin') delete prof.salary;
+  res.json(prof);
 });
-app.post('/api/teachers/:id/assignments', requireAuth, (req, res) => {
+app.post('/api/teachers/:id/assignments', requireAdmin, (req, res) => {
   const b = req.body || {};
   db.prepare('INSERT OR IGNORE INTO teacher_assignments (teacher_id,class_name,subject) VALUES (?,?,?)').run(req.params.id, b.class_name, b.subject);
   res.json({ ok: true });
 });
-app.get('/api/staff-attendance', requireAuth, (req, res) => {
+app.get('/api/staff-attendance', requireAdmin, (req, res) => {
   const { date } = req.query;
   if (!date) return res.status(400).json({ error: 'date required' });
   res.json(db.prepare('SELECT sa.*, t.name FROM staff_attendance sa JOIN teachers t ON t.id=sa.teacher_id WHERE sa.date=? ORDER BY t.name').all(date));
 });
-app.post('/api/staff-attendance', requireAuth, (req, res) => {
+app.post('/api/staff-attendance', requireAdmin, (req, res) => {
   const { date, records } = req.body || {};
   if (!date || !Array.isArray(records)) return res.status(400).json({ error: 'date and records required' });
   const ins = db.prepare('INSERT INTO staff_attendance (teacher_id,date,status) VALUES (?,?,?) ON CONFLICT(teacher_id,date) DO UPDATE SET status=excluded.status');
@@ -528,21 +710,28 @@ app.post('/api/staff-attendance', requireAuth, (req, res) => {
 });
 
 // leaving / promotions
-app.get('/api/leaving', requireAuth, (req, res) => {
+app.get('/api/leaving', requireAdmin, (req, res) => {
   res.json(db.prepare('SELECT l.*, s.name, s.father_name, s.phone FROM leaving_records l JOIN students s ON s.id=l.student_id ORDER BY l.leaving_date DESC').all());
 });
-app.get('/api/promotions', requireAuth, (req, res) => {
+app.get('/api/promotions', requireAdmin, (req, res) => {
   res.json(db.prepare('SELECT p.*, s.name, s.class_name FROM promotions p JOIN students s ON s.id=p.student_id ORDER BY p.date DESC, s.name LIMIT 500').all());
 });
 
 // timetable
 app.get('/api/timetable', requireAuth, (req, res) => {
   const { class: cls } = req.query;
+  const role = req.session.role || 'admin';
   let sql = 'SELECT tt.*, t.name teacher_name FROM timetable tt LEFT JOIN teachers t ON t.id=tt.teacher_id WHERE 1=1'; const p = [];
+  if (role === 'teacher') { sql += ' AND tt.teacher_id=?'; p.push(req.session.teacherId); }
+  if (role === 'parent') {
+    const child = db.prepare('SELECT class_name FROM students WHERE id=?').get(req.session.studentId);
+    if (!child) return res.json([]);
+    sql += ' AND tt.class_name=?'; p.push(child.class_name);
+  }
   if (cls) { sql += ' AND tt.class_name=?'; p.push(cls); }
   res.json(db.prepare(sql + ' ORDER BY tt.day, tt.period').all(...p));
 });
-app.post('/api/timetable/regenerate', requireAuth, (req, res) => {
+app.post('/api/timetable/regenerate', requireAdmin, (req, res) => {
   // Rebuild timetable from current teacher assignments (same rotation as seed)
   db.prepare('DELETE FROM timetable').run();
   const days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
@@ -564,6 +753,50 @@ app.post('/api/timetable/regenerate', requireAuth, (req, res) => {
     });
   }
   res.json({ ok: true, periods: 432 });
+});
+
+// ---------- export & backup (admin only) ----------
+// CSVs use proper quoting (names with commas/quotes stay intact) and a
+// UTF-8 BOM so Urdu/English names open correctly in Excel.
+app.get('/api/export/students', requireAdmin, (req, res) => {
+  const { class: cls, search } = req.query;
+  let sql = 'SELECT * FROM students WHERE 1=1'; const p = [];
+  if (cls) { sql += ' AND class_name=?'; p.push(cls); }
+  if (search) { sql += ' AND (name LIKE ? OR father_name LIKE ? OR roll_no LIKE ?)'; p.push(`%${search}%`, `%${search}%`, `%${search}%`); }
+  const rows = db.prepare(sql + ' ORDER BY class_name, CAST(roll_no AS INTEGER)').all(...p);
+  sendCsv(res, 'students.csv', ['ID', 'Name', 'Father Name', 'Class', 'Section', 'Roll No', 'Parent Phone', 'Monthly Fee (Rs)', 'Admission Date', 'Status'],
+    rows.map(s => [s.id, s.name, s.father_name, s.class_name, s.section, s.roll_no, s.phone, s.monthly_fee, s.admission_date, s.status]));
+});
+app.get('/api/export/fees', requireAdmin, (req, res) => {
+  const month = req.query.month || '2026-11';
+  const rows = db.prepare('SELECT f.*, s.name, s.class_name FROM fees f JOIN students s ON s.id=f.student_id WHERE f.month=? ORDER BY s.class_name, s.name').all(month);
+  sendCsv(res, 'fees-' + month + '.csv', ['Student', 'Class', 'Month', 'Amount (Rs)', 'Paid (Rs)', 'Pending (Rs)', 'Status', 'Payment Method', 'Payment Date'],
+    rows.map(f => [f.name, f.class_name, f.month, f.amount, f.paid, f.amount - f.paid, f.status, f.payment_method || '', f.payment_date || '']));
+});
+app.get('/api/export/results', requireAdmin, (req, res) => {
+  const exam = req.query.exam || 'Mid Term 2026';
+  const rows = db.prepare('SELECT r.*, s.name, s.class_name FROM results r JOIN students s ON s.id=r.student_id WHERE r.exam=? ORDER BY s.class_name, s.name, r.subject').all(exam);
+  sendCsv(res, 'results.csv', ['Student', 'Class', 'Exam', 'Subject', 'Marks', 'Total Marks', 'Percentage'],
+    rows.map(r => [r.name, r.class_name, r.exam, r.subject, r.marks, r.total_marks, Math.round(r.marks / r.total_marks * 1000) / 10]));
+});
+app.get('/api/export/attendance', requireAdmin, (req, res) => {
+  const { date, month, class: cls } = req.query;
+  let sql = 'SELECT a.*, s.name FROM attendance a JOIN students s ON s.id=a.student_id WHERE 1=1'; const p = [];
+  if (date) { sql += ' AND a.date=?'; p.push(date); }
+  else if (month) { sql += ' AND substr(a.date,1,7)=?'; p.push(month); }
+  else { sql += ' AND a.date=?'; p.push('2026-11-25'); }
+  if (cls) { sql += ' AND a.class_name=?'; p.push(cls); }
+  const rows = db.prepare(sql + ' ORDER BY a.date, a.class_name, s.name').all(...p);
+  sendCsv(res, 'attendance.csv', ['Student', 'Class', 'Date', 'Status'],
+    rows.map(a => [a.name, a.class_name, a.date, a.status]));
+});
+app.get('/api/backup', requireAdmin, (req, res) => {
+  // Flush the WAL file into the main DB file so the download is complete.
+  try { db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } catch (e) { /* best effort */ }
+  const name = 'school-backup-' + new Date().toISOString().slice(0, 10) + '.db';
+  res.setHeader('Content-Type', 'application/x-sqlite3');
+  res.setHeader('Content-Disposition', 'attachment; filename="' + name + '"');
+  res.sendFile(path.resolve(DB_PATH));
 });
 
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));

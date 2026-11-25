@@ -29,7 +29,12 @@ all data is saved on the server in `data/school.db` via the Express API.
   + time, auto-generated from teacher assignments; each teacher's own weekly
   timetable is in their profile. Regenerate any time.
 
-## Demo login (seeded on first run)
+## Demo logins (seeded on first run / on startup)
+
+The login page has a role picker — Admin / Teacher / Parent. The server
+decides the role from the account itself, never from what the browser sends.
+
+### Admin — full access
 
 | | |
 |---|---|
@@ -37,9 +42,90 @@ all data is saved on the server in `data/school.db` via the Express API.
 | Password | `admin123` |
 | School | Demo School |
 
-The login page shows this demo login. Change it after first login by
-registering a new school account, or edit the seeded user in the DB.
+Change it after first login by registering a new school account, or edit
+the seeded user in the DB.
 **Do not keep `admin123` in production — create your own account.**
+
+### Teachers — own classes/subjects only (password `teacher123` for all)
+
+| Username | Teacher | Classes (Maths unless noted) |
+|---|---|---|
+| `ahmed` | Ahmed Raza | Nursery, KG, 1, 2, 3 |
+| `fatima` | Fatima Zahra | English classes |
+| `asif` | Muhammad Asif | Urdu classes |
+| `ayesha` | Ayesha Khan | Science classes |
+| `bilal` | Bilal Hussain | Chemistry classes |
+| `sana` | Sana Malik | Biology classes |
+| `usman` | Usman Ghani | Physics classes |
+| `maryam` | Maryam Nawaz | Islamiat classes |
+| `hassan` | Hassan Ali | Computer classes |
+| `hira` | Hira Shah | Social Studies classes |
+| `omar` | Omar Farooq | Drawing classes |
+| `zainab` | Zainab Bibi | Nazra Quran classes |
+| `danish` | Danish Iqbal | Rhymes classes |
+| `amna` | Amna Tariq | Maths classes |
+
+Teacher accounts are created automatically on startup (and on first seed)
+for all 14 teachers. Teacher accounts are **not** self-registered —
+admin creates them; the demo ones above already exist. Change the demo
+password by editing the user in the DB or by adding a password-change
+flow before real use.
+
+### Parents — only their own child (password `parent123` for all)
+
+| Username | Child | Class | Roll | Parent phone |
+|---|---|---|---|---|
+| `parent1` | Sara Qureshi | Nursery | 01 | 0314941079 |
+| `parent2` | Noor Ali | 1 | 01 | 0378713488 |
+| `parent3` | Amna Ahmed | 5 | 01 | 0325868560 |
+| `parent4` | Laiba Butt | 8 | 01 | 0321443194 |
+| `parent5` | Noor Hussain | 10 | 01 | 0357749725 |
+
+A real parent can also **register their own account**: on the login page
+pick role **Parent**, enter parent phone + student roll no + class (exactly
+as in the school record), a username and a password. The server links the
+account to that one student only — a wrong phone/roll/class is rejected.
+
+### Role permissions
+
+| Feature | Admin | Teacher | Parent |
+|---|---|---|---|
+| Dashboard (full: fees, all students) | ✅ | — | — |
+| Students: add / edit / delete | ✅ | — | — |
+| Students: view | all | only own classes | only own child |
+| Attendance: mark | ✅ all | ✅ own classes only | — |
+| Fees (view / challans / payments) | ✅ | — (never sees fees) | own child only, via child profile |
+| Results | ✅ all | own subjects only | own child only |
+| Teachers & salaries | ✅ | own profile only, salary hidden | — |
+| Staff attendance | ✅ | own % in own profile | — |
+| Timetable | ✅ all classes | own timetable only | child's class only |
+| Leaving / Promoted records | ✅ | — | own child, via child profile |
+| Backup & CSV Export | ✅ | — | — |
+
+## Backup & Export (admin only)
+
+In the app: **Backup & Export** tab (admin only), plus Export buttons
+inside Students / Fees / Results / Attendance.
+
+- **Full database backup** — `GET /api/backup` downloads the whole SQLite
+  file (`school-backup-YYYY-MM-DD.db`). This is the backup: save it
+  somewhere safe (Google Drive / computer) once a week. If the server
+  data is lost or corrupted, the school can be restored from this file.
+  The server flushes the WAL file before sending, so the download is complete.
+- **CSV exports** (proper quoting, UTF-8 BOM so Urdu/English names open
+  correctly in Excel):
+  - `GET /api/export/students` — all students (optional `?class=` / `?search=`)
+  - `GET /api/export/fees?month=2026-11` — challans for a month
+  - `GET /api/export/results?exam=Mid Term 2026` — subject marks + %
+  - `GET /api/export/attendance?date=2026-11-25` (or `?month=2026-11`) — attendance
+- All export/backup endpoints are login-required and **admin-only**
+  (teachers and parents get 403).
+
+> **Existing deployments:** the new `role` / `teacher_id` / `student_id`
+> columns and the teacher + parent demo accounts are created automatically
+> on server startup (`ensureRoleAccounts()`), so a Railway redeploy of
+> this code upgrades the existing database in place — the 249 seeded
+> students, fees and results are NOT touched.
 
 ## Demo data (seeded automatically on first run, only when the DB is empty)
 
@@ -99,8 +185,10 @@ this app because it keeps the SQLite file on a volume.
 ## How a school logs in
 
 1. Open the deployed link.
-2. Login with the demo account, or click **Create Account** with the
-   school's own username / password / school name.
+2. Pick a role (Admin / Teacher / Parent) and login with that role's
+   demo account, or click **Create Account** with the school's own
+   username / password / school name (admin) — or, for a parent, with
+   parent phone + student roll no + class.
 3. The dashboard, students, attendance, fees, results, teachers and
    timetable are all saved in the server database — closing the browser
    does not lose data. Each school should have its own deployment (or its
@@ -109,14 +197,24 @@ this app because it keeps the SQLite file on a volume.
 ## API (all under `/api`, login required except login/register)
 
 `POST /api/login`, `POST /api/register`, `GET /api/me`,
+`GET /api/my-child` (parent), `GET /api/my-teacher` (teacher),
 `GET /api/dashboard`, `GET/POST/PUT/DELETE /api/students`,
 `GET /api/students/:id`, `POST /api/students/:id/leave`,
 `POST /api/students/:id/promote`, `GET/POST /api/attendance`,
+`GET /api/attendance/summary`,
 `GET /api/fees`, `POST /api/fees/generate`, `POST /api/fees/:id/pay`,
 `GET/POST /api/results`, `GET/POST /api/teachers`,
-`GET /api/teachers/:id`, `GET/POST /api/staff-attendance`,
+`GET /api/teachers/:id`, `POST /api/teachers/:id/assignments`,
+`GET/POST /api/staff-attendance`,
 `GET /api/leaving`, `GET /api/promotions`,
-`GET /api/timetable`, `POST /api/timetable/regenerate`.
+`GET /api/timetable`, `POST /api/timetable/regenerate`,
+`GET /api/export/students`, `GET /api/export/fees`,
+`GET /api/export/results`, `GET /api/export/attendance`,
+`GET /api/backup` (admin only, downloads the SQLite file).
+
+Write operations (add/edit/delete students, fees, results, teachers,
+timetable regenerate, leaving/promote) are admin-only, except attendance
+marking which teachers may also do for their own classes.
 
 ## Files
 
