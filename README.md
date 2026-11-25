@@ -48,6 +48,41 @@ all data is saved on the server in `data/school.db` via the Express API.
     `GET /api/leaving?search=`, `GET /api/promotions?search=`.
 - **Attendance** — date-wise Present / Absent / Late / Leave, bulk mark,
   monthly % summary (API: `/api/attendance/summary`).
+  - **Dashboard updates immediately after an edit:** the dashboard is
+    refetched after every attendance save (student or staff), and also
+    whenever the Date / Month at the top is changed or Refresh is pressed.
+    Previously the dashboard was only fetched once at login, so an
+    attendance edit never changed the figures until re-login. The
+    Attendance tab also prefills the already-saved values for the chosen
+    date/class, so an edit shows the real saved values instead of
+    resetting everything to Present.
+  - **1st-period rule (student attendance):** only the teacher who has
+    Period 1 for a class on that day may mark that class's attendance.
+    The timetable is the source of truth (Period 1, 08:00–08:45). The
+    marking option is **hidden entirely** for a teacher who does not hold
+    Period 1 for that class — no Save button, no status dropdowns, no
+    “Mark all Present”; only a red notice naming the Period 1 teacher
+    (“Sirf 1st period wale teacher attendance laga sakte hain”) plus a
+    read-only view of the already-saved attendance. A teacher who holds
+    Period 1 sees a green notice and the full marking sheet. When a
+    teacher opens the Attendance tab it defaults to a class where they
+    hold Period 1 today, if they have one. The server enforces the same
+    rule (403) so it cannot be bypassed from the browser. Admin can mark
+    attendance for any class. NOTE: in the seeded timetable Period 1 is
+    always the class's first subject (English), so the English teacher of
+    a class holds Period 1 — e.g. on Wednesday Fatima Zahra holds Period
+    1 for 10 of 12 classes. If a school wants a different teacher to mark
+    attendance, change the Period 1 teacher in the timetable (or
+    regenerate it after changing assignments).
+  - **Staff Attendance (separate tab, not student attendance):** admin
+    gets a **Staff Attendance** tab and teachers get **My Staff
+    Attendance**. Admin lists all teachers, marks Present / Absent / Late
+    / Leave per date, saves, and sees a monthly summary (Present / Total
+    / %) per teacher. A teacher sees only their own record + monthly %.
+    Marking is admin-only; the dashboard card “Staff Present Today”
+    updates as soon as staff attendance is saved. APIs:
+    `GET /api/staff-attendance?date=`, `POST /api/staff-attendance`,
+    `GET /api/staff-attendance/summary?month=`.
 - **Fees** — generate monthly challans, Cash / JazzCash / EasyPaisa / Bank,
   partial payment, pending list, collected / pending totals.
 - **Results** — exam-wise subject marks, auto total / percentage / grade,
@@ -86,7 +121,13 @@ all data is saved on the server in `data/school.db` via the Express API.
   - **Previous Class Results (student profile):** opening a student's
     profile shows the current class result first, then a separate
     **“Previous Class Results”** section — exam, class, total marks,
-    percentage, grade and year. It lists (a) grouped subject results
+    percentage, grade and year, with a **“View Report Card”** button on
+    every previous row. Clicking it opens that previous class/exam's full
+    report card — subjects, marks, total, percentage and grade, printable
+    just like the current report card (with a “Back to Profile” button).
+    For promotion-only rows with no saved subject breakdown, the card
+    shows the exam / class / percentage / grade from the promotion record
+    with a note saying so. It lists (a) grouped subject results
     added for a previous class, and (b) the student's promotion
     records (exam, previous class, percentage, year), so a promoted
     student's old class result is visible even before any detailed

@@ -223,6 +223,32 @@ function teacherClasses(req) {
   if (!req.session.teacherId) return [];
   return db.prepare('SELECT DISTINCT class_name FROM teacher_assignments WHERE teacher_id=?').all(req.session.teacherId).map(r => r.class_name);
 }
+// ---- 1st-period rule (student attendance) ----
+// Only the teacher who has Period 1 for a class on a given day may mark
+// that class's student attendance that day. The timetable is the source
+// of truth: timetable rows are Mon–Sat, Period 1 (08:00–08:45).
+// NOTE on the seeded timetable: Period 1 is always the class's first
+// subject (English), so the English teacher of a class holds Period 1 —
+// e.g. on Wednesday 2026-11-25 Fatima Zahra holds Period 1 for 10 of 12
+// classes, Bilal Hussain for Class 5, Hassan Ali for Nursery. A Maths
+// teacher (e.g. Ahmed Raza, Period 3) therefore cannot mark attendance.
+// Admin can always mark attendance for any class.
+const TT_DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+function dayNameOf(dateStr) {
+  const d = new Date(dateStr + 'T00:00:00');
+  if (isNaN(d)) return null;
+  return TT_DAY_NAMES[d.getDay()];
+}
+function period1Teacher(className, dateStr) {
+  const day = dayNameOf(dateStr);
+  if (!day) return null;
+  return db.prepare('SELECT tt.*, t.name teacher_name FROM timetable tt LEFT JOIN teachers t ON t.id=tt.teacher_id WHERE tt.class_name=? AND tt.day=? AND tt.period=1').get(className, day) || null;
+}
+function period1Error(className, dateStr) {
+  const p1 = period1Teacher(className, dateStr);
+  if (!p1) return 'Sirf 1st period wale teacher attendance laga sakte hain — Class ' + className + ' ki 1st period ' + (dayNameOf(dateStr) || dateStr) + ' ko timetable mein nahi hai.';
+  return 'Sirf 1st period wale teacher attendance laga sakte hain — Class ' + className + ' ki 1st period ' + (p1.teacher_name || 'kisi teacher') + ' ki hai (' + p1.subject + ', Period 1, ' + p1.start_time + '–' + p1.end_time + ').';
+}
 function requireRole(...roles) {
   return (req, res, next) => {
     if (!req.session || !req.session.userId) return res.status(401).json({ error: 'Login required' });
@@ -655,18 +681,46 @@ app.get('/api/attendance', requireAuth, (req, res) => {
   if (cls) { sql += ' AND a.class_name=?'; p.push(cls); }
   res.json(db.prepare(sql + ' ORDER BY a.class_name, s.name').all(...p));
 });
+// Who may mark attendance for a class on a date? Admin: anyone. Teacher:
+// only the teacher who holds Period 1 for that class on that weekday.
+// The UI calls this before saving so it can disable the Save button with
+// a clear message instead of letting the teacher fill the whole sheet.
+app.get('/api/attendance/permission', requireRole('admin', 'teacher'), (req, res) => {
+  const { date, class: cls } = req.query;
+  if (!date || !cls) return res.status(400).json({ error: 'date and class required' });
+  const p1 = period1Teacher(cls, date);
+  const isAdmin = (req.session.role || 'admin') === 'admin';
+  const allowed = isAdmin || (!!p1 && p1.teacher_id === req.session.teacherId);
+  res.json({
+    allowed, admin: isAdmin, day: dayNameOf(date),
+    period1TeacherId: p1 ? p1.teacher_id : null,
+    period1TeacherName: p1 ? p1.teacher_name : null,
+    subject: p1 ? p1.subject : null,
+    startTime: p1 ? p1.start_time : null, endTime: p1 ? p1.end_time : null,
+    message: allowed ? '' : period1Error(cls, date),
+  });
+});
 app.post('/api/attendance', requireRole('admin', 'teacher'), (req, res) => {
   const { date, records } = req.body || {};
   if (!date || !Array.isArray(records)) return res.status(400).json({ error: 'date and records required' });
-  const my = (req.session.role || 'admin') === 'teacher' ? teacherClasses(req) : null;
-  const ins = db.prepare('INSERT INTO attendance (student_id,date,status,class_name) VALUES (?,?,?,?) ON CONFLICT(student_id,date) DO UPDATE SET status=excluded.status');
+  const isTeacher = (req.session.role || 'admin') === 'teacher';
+  // Validate ALL records first (before inserting any) so a denied save
+  // never leaves half the class marked.
+  const prepared = [];
   for (const r of records) {
     const s = db.prepare('SELECT class_name FROM students WHERE id=?').get(r.student_id);
     if (!s) continue;
-    if (my && !my.includes(s.class_name)) return res.status(403).json({ error: 'You can only mark attendance for your own classes' });
-    ins.run(r.student_id, date, r.status, s.class_name);
+    if (isTeacher) {
+      const p1 = period1Teacher(s.class_name, date);
+      if (!p1 || p1.teacher_id !== req.session.teacherId) {
+        return res.status(403).json({ error: period1Error(s.class_name, date) });
+      }
+    }
+    prepared.push({ student_id: r.student_id, status: r.status, class_name: s.class_name });
   }
-  res.json({ ok: true, saved: records.length });
+  const ins = db.prepare('INSERT INTO attendance (student_id,date,status,class_name) VALUES (?,?,?,?) ON CONFLICT(student_id,date) DO UPDATE SET status=excluded.status');
+  for (const r of prepared) ins.run(r.student_id, date, r.status, r.class_name);
+  res.json({ ok: true, saved: prepared.length });
 });
 app.get('/api/attendance/summary', requireAuth, (req, res) => {
   const { month, class: cls } = req.query;
@@ -828,10 +882,33 @@ app.post('/api/teachers/:id/assignments', requireAdmin, (req, res) => {
   db.prepare('INSERT OR IGNORE INTO teacher_assignments (teacher_id,class_name,subject) VALUES (?,?,?)').run(req.params.id, b.class_name, b.subject);
   res.json({ ok: true });
 });
-app.get('/api/staff-attendance', requireAdmin, (req, res) => {
+// ---- Staff Attendance (separate from student attendance) ----
+// Marking is admin-only. Reading: admin sees everyone, a teacher sees
+// only their own record — so the Staff Attendance tab can be shown to
+// teachers as "My Staff Attendance" without leaking other staff.
+app.get('/api/staff-attendance', requireAuth, (req, res) => {
   const { date } = req.query;
   if (!date) return res.status(400).json({ error: 'date required' });
+  const role = req.session.role || 'admin';
+  if (role === 'parent') return res.status(403).json({ error: 'Parents cannot see staff attendance' });
+  if (role === 'teacher') {
+    return res.json(db.prepare('SELECT sa.*, t.name FROM staff_attendance sa JOIN teachers t ON t.id=sa.teacher_id WHERE sa.date=? AND sa.teacher_id=? ORDER BY t.name').all(date, req.session.teacherId));
+  }
   res.json(db.prepare('SELECT sa.*, t.name FROM staff_attendance sa JOIN teachers t ON t.id=sa.teacher_id WHERE sa.date=? ORDER BY t.name').all(date));
+});
+app.get('/api/staff-attendance/summary', requireAuth, (req, res) => {
+  const { month } = req.query;
+  if (!month) return res.status(400).json({ error: 'month required (YYYY-MM)' });
+  const role = req.session.role || 'admin';
+  if (role === 'parent') return res.status(403).json({ error: 'Parents cannot see staff attendance' });
+  let teachers = db.prepare('SELECT id, name, designation FROM teachers ORDER BY name').all();
+  if (role === 'teacher') teachers = teachers.filter(t => t.id === req.session.teacherId);
+  const rows = teachers.map(t => {
+    const r = db.prepare("SELECT COUNT(*) total, SUM(CASE WHEN status='Present' THEN 1 ELSE 0 END) present FROM staff_attendance WHERE teacher_id=? AND substr(date,1,7)=?").get(t.id, month);
+    const total = r.total || 0, present = r.present || 0;
+    return { teacher_id: t.id, name: t.name, designation: t.designation, total, present, pct: total ? Math.round(present / total * 1000) / 10 : 0 };
+  });
+  res.json(rows);
 });
 app.post('/api/staff-attendance', requireAdmin, (req, res) => {
   const { date, records } = req.body || {};
